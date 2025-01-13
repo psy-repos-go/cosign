@@ -18,8 +18,8 @@ package cli
 import (
 	"github.com/spf13/cobra"
 
-	"github.com/sigstore/cosign/cmd/cosign/cli/generate"
-	"github.com/sigstore/cosign/cmd/cosign/cli/options"
+	"github.com/sigstore/cosign/v2/cmd/cosign/cli/generate"
+	"github.com/sigstore/cosign/v2/cmd/cosign/cli/options"
 )
 
 func Generate() *cobra.Command {
@@ -42,7 +42,8 @@ to sign payloads with your own tooling or algorithms.`,
   # Use this payload in another tool
   gpg --output image.sig --detach-sig <(cosign generate <IMAGE>)`,
 
-		Args: cobra.ExactArgs(1),
+		Args:             cobra.ExactArgs(1),
+		PersistentPreRun: options.BindViper,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			annotationMap, err := o.AnnotationsMap()
 			if err != nil {

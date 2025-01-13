@@ -16,25 +16,20 @@
 package cosign
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"syscall"
 
-	"github.com/pkg/errors"
 	"golang.org/x/term"
 )
 
-// TODO need to centralize this logic
-func FileExists(filename string) bool {
-	info, err := os.Stat(filename)
-	if os.IsNotExist(err) {
-		return false
-	}
-	return !info.IsDir()
-}
-
+// TODO(jason): Move this to an internal package.
 func GetPassFromTerm(confirm bool) ([]byte, error) {
 	fmt.Fprint(os.Stderr, "Enter password for private key: ")
-	pw1, err := term.ReadPassword(0)
+	// Unnecessary convert of syscall.Stdin on *nix, but Windows is a uintptr
+	// nolint:unconvert
+	pw1, err := term.ReadPassword(int(syscall.Stdin))
 	if err != nil {
 		return nil, err
 	}
@@ -43,7 +38,9 @@ func GetPassFromTerm(confirm bool) ([]byte, error) {
 		return pw1, nil
 	}
 	fmt.Fprint(os.Stderr, "Enter password for private key again: ")
-	confirmpw, err := term.ReadPassword(0)
+	// Unnecessary convert of syscall.Stdin on *nix, but Windows is a uintptr
+	// nolint:unconvert
+	confirmpw, err := term.ReadPassword(int(syscall.Stdin))
 	fmt.Fprintln(os.Stderr)
 	if err != nil {
 		return nil, err
@@ -55,6 +52,7 @@ func GetPassFromTerm(confirm bool) ([]byte, error) {
 	return pw1, nil
 }
 
+// TODO(jason): Move this to an internal package.
 func IsTerminal() bool {
 	stat, _ := os.Stdin.Stat()
 	return (stat.Mode() & os.ModeCharDevice) != 0

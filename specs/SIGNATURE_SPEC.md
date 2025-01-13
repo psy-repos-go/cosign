@@ -65,6 +65,8 @@ Ej6T/GLK6XJSB28haSPRWB7k
   This OPTIONAL property contains a PEM-encoded, DER-formatted, ASN.1 x509 certificate chain.
   The `certificate` property MUST be present if this property is present.
   This chain MAY be used by implementations to verify the `certificate` property.
+  Clients MUST validate that any certificates in the chain that are self-signed
+  or are expected to be trust anchors with an out-of-band mechanism.
 
   Example `chain`:
 
@@ -115,15 +117,24 @@ Gyp4apdU7AXEwysEQIb034aPrTlpmxh90SnTZFs2DHOvCjCPPAmoWfuQUwPhSPRb
   }
 }
 ```
-  The following are REQUIRED properties of the bundle:
-    - The `SignedEntryTimestamp` is a rekor-signed signature over the logIndex, body and integratedTime of the Rekor Log Entry
-    - The `Payload` consists of all fields required to verify the SET:
-      - The `body` is the body of the Rekor Log Entry
-      - The `integratedTime` is the UNIX timestamp the log entry was integrated into the transparency log
-      - The `logIndex` is the index of the log entry in the transparency log
-      - The `logID` is the SHA256 hash of the DER-encoded public key for the log at the time the entry was included in the log
 
-For instructions on using the `bundle` for verification, see [USAGE.md](../USAGE.md#verify-a-signature-was-added-to-the-transparency-log).
+  The following are REQUIRED properties of the bundle:
+
+  - The `SignedEntryTimestamp` is a rekor-signed signature over the logIndex, body and integratedTime of the Rekor Log Entry
+  - The `Payload` consists of all fields required to verify the SET:
+    - The `body` is the body of the Rekor Log Entry
+    - The `integratedTime` is the UNIX timestamp the log entry was integrated into the transparency log
+    - The `logIndex` is the index of the log entry in the transparency log
+    - The `logID` is the SHA256 hash of the DER-encoded public key for the log at the time the entry was included in the log
+
+* `rfc3161timestamp` string
+
+  This OPTIONAL property contains a JSON formatted `RFC3161Timestamp` containing the timestamp response from a
+  timestamp authority.
+
+### Verification
+
+See the [client specification on verification](https://github.com/sigstore/architecture-docs/blob/main/client-spec.md#4-verification).
 
 ## Storage
 

@@ -21,12 +21,17 @@ import (
 
 // AttestOptions is the top level wrapper for the attest command.
 type AttestOptions struct {
-	Key       string
-	Cert      string
-	NoUpload  bool
-	Force     bool
-	Recursive bool
-	Replace   bool
+	Key                     string
+	Cert                    string
+	CertChain               string
+	NoUpload                bool
+	Recursive               bool
+	Replace                 bool
+	SkipConfirmation        bool
+	TlogUpload              bool
+	TSAServerURL            string
+	RekorEntryType          string
+	RecordCreationTimestamp bool
 
 	Rekor       RekorOptions
 	Fulcio      FulcioOptions
@@ -49,19 +54,40 @@ func (o *AttestOptions) AddFlags(cmd *cobra.Command) {
 
 	cmd.Flags().StringVar(&o.Key, "key", "",
 		"path to the private key file, KMS URI or Kubernetes Secret")
+	_ = cmd.Flags().SetAnnotation("key", cobra.BashCompFilenameExt, []string{"key"})
 
-	cmd.Flags().StringVar(&o.Cert, "cert", "",
-		"path to the x509 certificate to include in the Signature")
+	cmd.Flags().StringVar(&o.Cert, "certificate", "",
+		"path to the X.509 certificate in PEM format to include in the OCI Signature")
+	_ = cmd.Flags().SetAnnotation("certificate", cobra.BashCompFilenameExt, []string{"cert"})
+
+	cmd.Flags().StringVar(&o.CertChain, "certificate-chain", "",
+		"path to a list of CA X.509 certificates in PEM format which will be needed "+
+			"when building the certificate chain for the signing certificate. "+
+			"Must start with the parent intermediate CA certificate of the "+
+			"signing certificate and end with the root certificate. Included in the OCI Signature")
+	_ = cmd.Flags().SetAnnotation("certificate-chain", cobra.BashCompFilenameExt, []string{"cert"})
 
 	cmd.Flags().BoolVar(&o.NoUpload, "no-upload", false,
 		"do not upload the generated attestation")
-
-	cmd.Flags().BoolVarP(&o.Force, "force", "f", false,
-		"skip warnings and confirmations")
 
 	cmd.Flags().BoolVarP(&o.Recursive, "recursive", "r", false,
 		"if a multi-arch image is specified, additionally sign each discrete image")
 
 	cmd.Flags().BoolVarP(&o.Replace, "replace", "", false,
 		"")
+
+	cmd.Flags().BoolVarP(&o.SkipConfirmation, "yes", "y", false,
+		"skip confirmation prompts for non-destructive operations")
+
+	cmd.Flags().BoolVar(&o.TlogUpload, "tlog-upload", true,
+		"whether or not to upload to the tlog")
+
+	cmd.Flags().StringVar(&o.RekorEntryType, "rekor-entry-type", "dsse",
+		"specifies the type to be used for a rekor entry upload. Options are intoto or dsse (default). ")
+
+	cmd.Flags().StringVar(&o.TSAServerURL, "timestamp-server-url", "",
+		"url to the Timestamp RFC3161 server, default none. Must be the path to the API to request timestamp responses, e.g. https://freetsa.org/tsr")
+
+	cmd.Flags().BoolVar(&o.RecordCreationTimestamp, "record-creation-timestamp", false,
+		"set the createdAt timestamp in the attestation artifact to the time it was created; by default, cosign sets this to the zero value")
 }

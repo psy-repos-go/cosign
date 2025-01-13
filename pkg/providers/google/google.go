@@ -23,7 +23,8 @@ import (
 	"google.golang.org/api/idtoken"
 	"google.golang.org/api/impersonate"
 
-	"github.com/sigstore/cosign/pkg/providers"
+	"github.com/sigstore/cosign/v2/pkg/cosign/env"
+	"github.com/sigstore/cosign/v2/pkg/providers"
 )
 
 func init() {
@@ -74,16 +75,16 @@ type googleImpersonate struct{}
 var _ providers.Interface = (*googleImpersonate)(nil)
 
 // Enabled implements providers.Interface
-func (gi *googleImpersonate) Enabled(ctx context.Context) bool {
+func (gi *googleImpersonate) Enabled(_ context.Context) bool {
 	// The "impersonate" method requires a target service account to impersonate.
-	return os.Getenv("GOOGLE_SERVICE_ACCOUNT_NAME") != ""
+	return env.Getenv(env.VariableGoogleServiceAccountName) != ""
 }
 
 // Provide implements providers.Interface
 func (gi *googleImpersonate) Provide(ctx context.Context, audience string) (string, error) {
-	target := os.Getenv("GOOGLE_SERVICE_ACCOUNT_NAME")
+	target := env.Getenv(env.VariableGoogleServiceAccountName)
 	ts, err := impersonate.IDTokenSource(ctx, impersonate.IDTokenConfig{
-		Audience:        "sigstore",
+		Audience:        audience,
 		TargetPrincipal: target,
 		IncludeEmail:    true,
 	})

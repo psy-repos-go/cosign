@@ -19,7 +19,6 @@
 /cosign*
 .vscode
 .idea
-/sget*
 
 # fuzzing artifacts
 *.libfuzzer
@@ -27,3 +26,9 @@
 
 bin*
 dist/
+cosignImagerefs
+bundle
+signature
+certificate
+
+**verify-experimental*

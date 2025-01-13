@@ -16,11 +16,13 @@
 package cli
 
 import (
-	"github.com/sigstore/cosign/cmd/cosign/cli/manifest"
-	"github.com/sigstore/cosign/cmd/cosign/cli/verify"
+	"fmt"
+
+	"github.com/sigstore/cosign/v2/cmd/cosign/cli/manifest"
+	"github.com/sigstore/cosign/v2/cmd/cosign/cli/verify"
 	"github.com/spf13/cobra"
 
-	"github.com/sigstore/cosign/cmd/cosign/cli/options"
+	"github.com/sigstore/cosign/v2/cmd/cosign/cli/options"
 )
 
 func Manifest() *cobra.Command {
@@ -52,9 +54,6 @@ against the transparency log.`,
   # additionally verify specified annotations
   cosign manifest verify -a key1=val1 -a key2=val2 <path/to/my-deployment.yaml>
 
-  # (experimental) additionally, verify with the transparency log
-  COSIGN_EXPERIMENTAL=1 cosign manifest verify <path/to/my-deployment.yaml>
-
   # verify images with public key
   cosign manifest verify --key cosign.pub <path/to/my-deployment.yaml>
 
@@ -72,7 +71,8 @@ against the transparency log.`,
 
   # verify images with public key stored in Hashicorp Vault
   cosign manifest verify --key hashivault://[KEY] <path/to/my-deployment.yaml>`,
-		Args: cobra.ExactArgs(1),
+		Args:             cobra.ExactArgs(1),
+		PersistentPreRun: options.BindViper,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			annotations, err := o.AnnotationsMap()
 			if err != nil {
@@ -80,20 +80,37 @@ against the transparency log.`,
 			}
 			v := &manifest.VerifyManifestCommand{
 				VerifyCommand: verify.VerifyCommand{
-					RegistryOptions: o.Registry,
-					CheckClaims:     o.CheckClaims,
-					KeyRef:          o.Key,
-					CertRef:         o.CertVerify.Cert,
-					CertEmail:       o.CertVerify.CertEmail,
-					CertOidcIssuer:  o.CertVerify.CertOidcIssuer,
-					Sk:              o.SecurityKey.Use,
-					Slot:            o.SecurityKey.Slot,
-					Output:          o.Output,
-					RekorURL:        o.Rekor.URL,
-					Attachment:      o.Attachment,
-					Annotations:     annotations,
+					RegistryOptions:              o.Registry,
+					CertVerifyOptions:            o.CertVerify,
+					CheckClaims:                  o.CheckClaims,
+					KeyRef:                       o.Key,
+					CertRef:                      o.CertVerify.Cert,
+					CertGithubWorkflowTrigger:    o.CertVerify.CertGithubWorkflowTrigger,
+					CertGithubWorkflowSha:        o.CertVerify.CertGithubWorkflowSha,
+					CertGithubWorkflowName:       o.CertVerify.CertGithubWorkflowName,
+					CertGithubWorkflowRepository: o.CertVerify.CertGithubWorkflowRepository,
+					CertGithubWorkflowRef:        o.CertVerify.CertGithubWorkflowRef,
+					CertChain:                    o.CertVerify.CertChain,
+					IgnoreSCT:                    o.CertVerify.IgnoreSCT,
+					SCTRef:                       o.CertVerify.SCT,
+					Sk:                           o.SecurityKey.Use,
+					Slot:                         o.SecurityKey.Slot,
+					Output:                       o.Output,
+					RekorURL:                     o.Rekor.URL,
+					Attachment:                   o.Attachment,
+					Annotations:                  annotations,
+					LocalImage:                   o.LocalImage,
+					Offline:                      o.CommonVerifyOptions.Offline,
+					TSACertChainPath:             o.CommonVerifyOptions.TSACertChainPath,
+					IgnoreTlog:                   o.CommonVerifyOptions.IgnoreTlog,
+					MaxWorkers:                   o.CommonVerifyOptions.MaxWorkers,
 				},
 			}
+
+			if o.CommonVerifyOptions.MaxWorkers == 0 {
+				return fmt.Errorf("please set the --max-worker flag to a value that is greater than 0")
+			}
+
 			return v.Exec(cmd.Context(), args)
 		},
 	}

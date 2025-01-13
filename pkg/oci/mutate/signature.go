@@ -18,32 +18,33 @@ import (
 	"bytes"
 	"crypto/x509"
 	"encoding/json"
+	"fmt"
 	"io"
 
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/types"
-	"github.com/pkg/errors"
-	"github.com/sigstore/cosign/pkg/cosign/bundle"
-	"github.com/sigstore/cosign/pkg/oci"
-	"github.com/sigstore/cosign/pkg/oci/static"
+	"github.com/sigstore/cosign/v2/pkg/cosign/bundle"
+	"github.com/sigstore/cosign/v2/pkg/oci"
+	"github.com/sigstore/cosign/v2/pkg/oci/static"
 	"github.com/sigstore/sigstore/pkg/cryptoutils"
 )
 
 type sigWrapper struct {
 	wrapped oci.Signature
 
-	annotations map[string]string
-	bundle      *bundle.RekorBundle
-	cert        *x509.Certificate
-	chain       []*x509.Certificate
-	mediaType   types.MediaType
+	annotations      map[string]string
+	bundle           *bundle.RekorBundle
+	rfc3161Timestamp *bundle.RFC3161Timestamp
+	cert             *x509.Certificate
+	chain            []*x509.Certificate
+	mediaType        types.MediaType
 }
 
 var _ v1.Layer = (*sigWrapper)(nil)
 var _ oci.Signature = (*sigWrapper)(nil)
 
 func copyAnnotations(ann map[string]string) map[string]string {
-	new := make(map[string]string, len(ann))
+	new := make(map[string]string, len(ann)) //nolint: revive
 	for k, v := range ann {
 		new[k] = v
 	}
@@ -61,6 +62,11 @@ func (sw *sigWrapper) Annotations() (map[string]string, error) {
 // Payload implements oci.Signature.
 func (sw *sigWrapper) Payload() ([]byte, error) {
 	return sw.wrapped.Payload()
+}
+
+// Signature implements oci.Signature
+func (sw *sigWrapper) Signature() ([]byte, error) {
+	return sw.wrapped.Signature()
 }
 
 // Base64Signature implements oci.Signature.
@@ -90,6 +96,14 @@ func (sw *sigWrapper) Bundle() (*bundle.RekorBundle, error) {
 		return sw.bundle, nil
 	}
 	return sw.wrapped.Bundle()
+}
+
+// RFC3161Timestamp implements oci.Signature.
+func (sw *sigWrapper) RFC3161Timestamp() (*bundle.RFC3161Timestamp, error) {
+	if sw.rfc3161Timestamp != nil {
+		return sw.rfc3161Timestamp, nil
+	}
+	return sw.wrapped.RFC3161Timestamp()
 }
 
 // MediaType implements v1.Layer
@@ -132,14 +146,14 @@ func Signature(original oci.Signature, opts ...SignatureOption) (oci.Signature, 
 	so := makeSignatureOption(opts...)
 	oldAnn, err := original.Annotations()
 	if err != nil {
-		return nil, errors.Wrap(err, "could not get annotations from signature to mutate")
+		return nil, fmt.Errorf("could not get annotations from signature to mutate: %w", err)
 	}
 
 	var newAnn map[string]string
 	if so.annotations != nil {
 		newAnn = copyAnnotations(so.annotations)
 		newAnn[static.SignatureAnnotationKey] = oldAnn[static.SignatureAnnotationKey]
-		for _, key := range []string{static.BundleAnnotationKey, static.CertificateAnnotationKey, static.ChainAnnotationKey} {
+		for _, key := range []string{static.BundleAnnotationKey, static.CertificateAnnotationKey, static.ChainAnnotationKey, static.RFC3161TimestampAnnotationKey} {
 			if val, isSet := oldAnn[key]; isSet {
 				newAnn[key] = val
 			} else {
@@ -157,6 +171,15 @@ func Signature(original oci.Signature, opts ...SignatureOption) (oci.Signature, 
 			return nil, err
 		}
 		newAnn[static.BundleAnnotationKey] = string(b)
+	}
+
+	if so.rfc3161Timestamp != nil {
+		newSig.rfc3161Timestamp = so.rfc3161Timestamp
+		b, err := json.Marshal(so.rfc3161Timestamp)
+		if err != nil {
+			return nil, err
+		}
+		newAnn[static.RFC3161TimestampAnnotationKey] = string(b)
 	}
 
 	if so.cert != nil {

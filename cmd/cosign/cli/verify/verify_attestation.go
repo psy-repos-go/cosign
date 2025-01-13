@@ -17,48 +17,59 @@ package verify
 
 import (
 	"context"
-	"crypto"
-	"crypto/ecdsa"
-	"encoding/base64"
-	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/google/go-containerregistry/pkg/name"
-	"github.com/in-toto/in-toto-golang/in_toto"
-	"github.com/pkg/errors"
-	"github.com/sigstore/cosign/pkg/cosign/pkcs11key"
-	"github.com/sigstore/cosign/pkg/cosign/rego"
-	"github.com/sigstore/cosign/pkg/oci"
-	"github.com/sigstore/sigstore/pkg/signature"
-
-	"github.com/sigstore/cosign/cmd/cosign/cli/fulcio"
-	"github.com/sigstore/cosign/cmd/cosign/cli/options"
-	"github.com/sigstore/cosign/cmd/cosign/cli/rekor"
-	"github.com/sigstore/cosign/pkg/cosign"
-	"github.com/sigstore/cosign/pkg/cosign/cue"
-	"github.com/sigstore/cosign/pkg/cosign/pivkey"
-	sigs "github.com/sigstore/cosign/pkg/signature"
+	"github.com/sigstore/cosign/v2/cmd/cosign/cli/fulcio"
+	"github.com/sigstore/cosign/v2/cmd/cosign/cli/options"
+	"github.com/sigstore/cosign/v2/cmd/cosign/cli/rekor"
+	"github.com/sigstore/cosign/v2/internal/ui"
+	"github.com/sigstore/cosign/v2/pkg/cosign"
+	"github.com/sigstore/cosign/v2/pkg/cosign/cue"
+	"github.com/sigstore/cosign/v2/pkg/cosign/pivkey"
+	"github.com/sigstore/cosign/v2/pkg/cosign/pkcs11key"
+	"github.com/sigstore/cosign/v2/pkg/cosign/rego"
+	"github.com/sigstore/cosign/v2/pkg/oci"
+	"github.com/sigstore/cosign/v2/pkg/policy"
+	sigs "github.com/sigstore/cosign/v2/pkg/signature"
 )
 
 // VerifyAttestationCommand verifies a signature on a supplied container image
 // nolint
 type VerifyAttestationCommand struct {
 	options.RegistryOptions
-	CheckClaims    bool
-	CertRef        string
-	CertEmail      string
-	CertOidcIssuer string
-	KeyRef         string
-	Sk             bool
-	Slot           string
-	Output         string
-	RekorURL       string
-	PredicateType  string
-	Policies       []string
-	LocalImage     bool
+	options.CertVerifyOptions
+	CheckClaims                  bool
+	KeyRef                       string
+	CertRef                      string
+	CertGithubWorkflowTrigger    string
+	CertGithubWorkflowSha        string
+	CertGithubWorkflowName       string
+	CertGithubWorkflowRepository string
+	CertGithubWorkflowRef        string
+	CAIntermediates              string
+	CARoots                      string
+	CertChain                    string
+	IgnoreSCT                    bool
+	SCTRef                       string
+	Sk                           bool
+	Slot                         string
+	Output                       string
+	RekorURL                     string
+	PredicateType                string
+	Policies                     []string
+	LocalImage                   bool
+	NameOptions                  []name.Option
+	Offline                      bool
+	TSACertChainPath             string
+	IgnoreTlog                   bool
+	MaxWorkers                   int
+	UseSignedTimestamps          bool
 }
 
 // Exec runs the verification command
@@ -67,32 +78,82 @@ func (c *VerifyAttestationCommand) Exec(ctx context.Context, images []string) (e
 		return flag.ErrHelp
 	}
 
-	if !options.OneOf(c.KeyRef, c.Sk, c.CertRef) && !options.EnableExperimental() {
+	// We can't have both a key and a security key
+	if options.NOf(c.KeyRef, c.Sk) > 1 {
 		return &options.KeyParseError{}
+	}
+
+	var identities []cosign.Identity
+	if c.KeyRef == "" {
+		identities, err = c.Identities()
+		if err != nil {
+			return err
+		}
 	}
 
 	ociremoteOpts, err := c.ClientOpts(ctx)
 	if err != nil {
-		return errors.Wrap(err, "constructing client options")
+		return fmt.Errorf("constructing client options: %w", err)
 	}
+
 	co := &cosign.CheckOpts{
-		RegistryClientOpts: ociremoteOpts,
-		CertEmail:          c.CertEmail,
-		CertOidcIssuer:     c.CertOidcIssuer,
+		RegistryClientOpts:           ociremoteOpts,
+		CertGithubWorkflowTrigger:    c.CertGithubWorkflowTrigger,
+		CertGithubWorkflowSha:        c.CertGithubWorkflowSha,
+		CertGithubWorkflowName:       c.CertGithubWorkflowName,
+		CertGithubWorkflowRepository: c.CertGithubWorkflowRepository,
+		CertGithubWorkflowRef:        c.CertGithubWorkflowRef,
+		IgnoreSCT:                    c.IgnoreSCT,
+		Identities:                   identities,
+		Offline:                      c.Offline,
+		IgnoreTlog:                   c.IgnoreTlog,
+		MaxWorkers:                   c.MaxWorkers,
+		UseSignedTimestamps:          c.TSACertChainPath != "" || c.UseSignedTimestamps,
 	}
 	if c.CheckClaims {
 		co.ClaimVerifier = cosign.IntotoSubjectClaimVerifier
 	}
-	if options.EnableExperimental() {
+	// Ignore Signed Certificate Timestamp if the flag is set or a key is provided
+	if shouldVerifySCT(c.IgnoreSCT, c.KeyRef, c.Sk) {
+		co.CTLogPubKeys, err = cosign.GetCTLogPubs(ctx)
+		if err != nil {
+			return fmt.Errorf("getting ctlog public keys: %w", err)
+		}
+	}
+
+	// If we are using signed timestamps, we need to load the TSA certificates
+	if co.UseSignedTimestamps {
+		tsaCertificates, err := cosign.GetTSACerts(ctx, c.TSACertChainPath, cosign.GetTufTargets)
+		if err != nil {
+			return fmt.Errorf("unable to load TSA certificates: %w", err)
+		}
+		co.TSACertificate = tsaCertificates.LeafCert
+		co.TSARootCertificates = tsaCertificates.RootCert
+		co.TSAIntermediateCertificates = tsaCertificates.IntermediateCerts
+	}
+
+	if !c.IgnoreTlog {
 		if c.RekorURL != "" {
 			rekorClient, err := rekor.NewClient(c.RekorURL)
 			if err != nil {
-				return errors.Wrap(err, "creating Rekor client")
+				return fmt.Errorf("creating Rekor client: %w", err)
 			}
 			co.RekorClient = rekorClient
 		}
-		co.RootCerts = fulcio.GetRoots()
+		// This performs an online fetch of the Rekor public keys, but this is needed
+		// for verifying tlog entries (both online and offline).
+		co.RekorPubKeys, err = cosign.GetRekorPubs(ctx)
+		if err != nil {
+			return fmt.Errorf("getting Rekor public keys: %w", err)
+		}
 	}
+
+	if keylessVerification(c.KeyRef, c.Sk) {
+		if err := loadCertsKeylessVerification(c.CertChain, c.CARoots, c.CAIntermediates, co); err != nil {
+			return err
+		}
+	}
+
 	keyRef := c.KeyRef
 
 	// Keys are optional!
@@ -100,7 +161,7 @@ func (c *VerifyAttestationCommand) Exec(ctx context.Context, images []string) (e
 	case keyRef != "":
 		co.SigVerifier, err = sigs.PublicKeyFromKeyRef(ctx, keyRef)
 		if err != nil {
-			return errors.Wrap(err, "loading public key")
+			return fmt.Errorf("loading public key: %w", err)
 		}
 		pkcs11Key, ok := co.SigVerifier.(*pkcs11key.Key)
 		if ok {
@@ -109,22 +170,53 @@ func (c *VerifyAttestationCommand) Exec(ctx context.Context, images []string) (e
 	case c.Sk:
 		sk, err := pivkey.GetKeyWithSlot(c.Slot)
 		if err != nil {
-			return errors.Wrap(err, "opening piv token")
+			return fmt.Errorf("opening piv token: %w", err)
 		}
 		defer sk.Close()
 		co.SigVerifier, err = sk.Verifier()
 		if err != nil {
-			return errors.Wrap(err, "initializing piv token verifier")
+			return fmt.Errorf("initializing piv token verifier: %w", err)
 		}
 	case c.CertRef != "":
 		cert, err := loadCertFromFileOrURL(c.CertRef)
 		if err != nil {
-			return errors.Wrap(err, "loading certificate from reference")
+			return fmt.Errorf("loading certificate from reference: %w", err)
 		}
-		co.SigVerifier, err = signature.LoadECDSAVerifier(cert.PublicKey.(*ecdsa.PublicKey), crypto.SHA256)
-		if err != nil {
-			return errors.Wrap(err, "creating certificate verifier")
+		if c.CertChain == "" {
+			// If no certChain is passed, the Fulcio root certificate will be used
+			co.RootCerts, err = fulcio.GetRoots()
+			if err != nil {
+				return fmt.Errorf("getting Fulcio roots: %w", err)
+			}
+			co.IntermediateCerts, err = fulcio.GetIntermediates()
+			if err != nil {
+				return fmt.Errorf("getting Fulcio intermediates: %w", err)
+			}
+			co.SigVerifier, err = cosign.ValidateAndUnpackCert(cert, co)
+			if err != nil {
+				return fmt.Errorf("creating certificate verifier: %w", err)
+			}
+		} else {
+			// Verify certificate with chain
+			chain, err := loadCertChainFromFileOrURL(c.CertChain)
+			if err != nil {
+				return err
+			}
+			co.SigVerifier, err = cosign.ValidateAndUnpackCertWithChain(cert, chain, co)
+			if err != nil {
+				return fmt.Errorf("creating certificate verifier: %w", err)
+			}
 		}
+		if c.SCTRef != "" {
+			sct, err := os.ReadFile(filepath.Clean(c.SCTRef))
+			if err != nil {
+				return fmt.Errorf("reading sct from file: %w", err)
+			}
+			co.SCT = sct
+		}
+	case c.CARoots != "":
+		// CA roots + possible intermediates are already loaded into co.RootCerts with the call to
+		// loadCertsKeylessVerification above.
 	}
 
 	// NB: There are only 2 kinds of verification right now:
@@ -144,7 +236,7 @@ func (c *VerifyAttestationCommand) Exec(ctx context.Context, images []string) (e
 				return err
 			}
 		} else {
-			ref, err := name.ParseReference(imageRef)
+			ref, err := name.ParseReference(imageRef, c.NameOptions...)
 			if err != nil {
 				return err
 			}
@@ -168,115 +260,60 @@ func (c *VerifyAttestationCommand) Exec(ctx context.Context, images []string) (e
 			}
 		}
 
+		var checked []oci.Signature
 		var validationErrors []error
+		// To aid in determining if there's a mismatch in what predicateType
+		// we're looking for and what we checked, keep track of them here so
+		// that we can help the user figure out if there's a typo, etc.
+		checkedPredicateTypes := []string{}
 		for _, vp := range verified {
-			var payloadData map[string]interface{}
-
-			p, err := vp.Payload()
+			payload, gotPredicateType, err := policy.AttestationToPayloadJSON(ctx, c.PredicateType, vp)
 			if err != nil {
-				return errors.Wrap(err, "could not get payload")
+				return fmt.Errorf("converting to consumable policy validation: %w", err)
 			}
-
-			err = json.Unmarshal(p, &payloadData)
-			if err != nil {
-				return errors.Wrap(err, "unmarshal payload data")
-			}
-
-			predicateURI, ok := options.PredicateTypeMap[c.PredicateType]
-			if !ok {
-				return fmt.Errorf("invalid predicate type: %s", c.PredicateType)
-			}
-
-			// sanity checks
-			if val, ok := payloadData["payloadType"]; ok {
-				// we need to check only given type from the cli flag
-				// so we are skipping other types
-				if predicateURI != val {
-					continue
-				}
-			} else {
-				return fmt.Errorf("could not find 'payloadType' in payload data")
-			}
-
-			var decodedPayload []byte
-			if val, ok := payloadData["payload"]; ok {
-				decodedPayload, err = base64.StdEncoding.DecodeString(val.(string))
-				if err != nil {
-					return fmt.Errorf("could not decode 'payload': %w", err)
-				}
-			} else {
-				return fmt.Errorf("could not find 'payload' in payload data")
-			}
-
-			var payload []byte
-			switch c.PredicateType {
-			case options.PredicateCustom:
-				var cosignStatement in_toto.Statement
-				if err := json.Unmarshal(decodedPayload, &cosignStatement); err != nil {
-					return fmt.Errorf("unmarshal CosignStatement: %w", err)
-				}
-				payload, err = json.Marshal(cosignStatement)
-				if err != nil {
-					return fmt.Errorf("error when generating CosignStatement: %w", err)
-				}
-			case options.PredicateLink:
-				var linkStatement in_toto.LinkStatement
-				if err := json.Unmarshal(decodedPayload, &linkStatement); err != nil {
-					return fmt.Errorf("unmarshal LinkStatement: %w", err)
-				}
-				payload, err = json.Marshal(linkStatement)
-				if err != nil {
-					return fmt.Errorf("error when generating LinkStatement: %w", err)
-				}
-			case options.PredicateSLSA:
-				var slsaProvenanceStatement in_toto.ProvenanceStatement
-				if err := json.Unmarshal(decodedPayload, &slsaProvenanceStatement); err != nil {
-					return fmt.Errorf("unmarshal ProvenanceStatement: %w", err)
-				}
-				payload, err = json.Marshal(slsaProvenanceStatement)
-				if err != nil {
-					return fmt.Errorf("error when generating ProvenanceStatement: %w", err)
-				}
-			case options.PredicateSPDX:
-				var spdxStatement in_toto.SPDXStatement
-				if err := json.Unmarshal(decodedPayload, &spdxStatement); err != nil {
-					return fmt.Errorf("unmarshal SPDXStatement: %w", err)
-				}
-				payload, err = json.Marshal(spdxStatement)
-				if err != nil {
-					return fmt.Errorf("error when generating SPDXStatement: %w", err)
-				}
+			checkedPredicateTypes = append(checkedPredicateTypes, gotPredicateType)
+			if len(payload) == 0 {
+				// This is not the predicate type we're looking for.
+				continue
 			}
 
 			if len(cuePolicies) > 0 {
-				fmt.Fprintf(os.Stderr, "will be validating against CUE policies: %v\n", cuePolicies)
+				ui.Infof(ctx, "will be validating against CUE policies: %v", cuePolicies)
 				cueValidationErr := cue.ValidateJSON(payload, cuePolicies)
 				if cueValidationErr != nil {
 					validationErrors = append(validationErrors, cueValidationErr)
+					continue
 				}
 			}
 
 			if len(regoPolicies) > 0 {
-				fmt.Fprintf(os.Stderr, "will be validating against Rego policies: %v\n", regoPolicies)
+				ui.Infof(ctx, "will be validating against Rego policies: %v", regoPolicies)
 				regoValidationErrs := rego.ValidateJSON(payload, regoPolicies)
 				if len(regoValidationErrs) > 0 {
 					validationErrors = append(validationErrors, regoValidationErrs...)
+					continue
 				}
 			}
+
+			checked = append(checked, vp)
 		}
 
 		if len(validationErrors) > 0 {
-			fmt.Fprintf(os.Stderr, "There are %d number of errors occurred during the validation:\n", len(validationErrors))
+			ui.Infof(ctx, "There are %d number of errors occurred during the validation:\n", len(validationErrors))
 			for _, v := range validationErrors {
-				_, _ = fmt.Fprintf(os.Stderr, "- %v\n", v)
+				ui.Infof(ctx, "- %v", v)
 			}
 			return fmt.Errorf("%d validation errors occurred", len(validationErrors))
 		}
 
+		if len(checked) == 0 {
+			return fmt.Errorf("none of the attestations matched the predicate type: %s, found: %s", c.PredicateType, strings.Join(checkedPredicateTypes, ","))
+		}
+
 		// TODO: add CUE validation report to `PrintVerificationHeader`.
-		PrintVerificationHeader(imageRef, co, bundleVerified, fulcioVerified)
+		PrintVerificationHeader(ctx, imageRef, co, bundleVerified, fulcioVerified)
 		// The attestations are always JSON, so use the raw "text" mode for outputting them instead of conversion
-		PrintVerification(imageRef, verified, "text")
+		PrintVerification(ctx, checked, "text")
 	}
 
 	return nil

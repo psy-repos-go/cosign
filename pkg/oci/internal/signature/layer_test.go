@@ -18,15 +18,17 @@ package signature
 import (
 	"bytes"
 	"encoding/base64"
+	"errors"
 	"fmt"
+	"io"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/random"
 	"github.com/google/go-containerregistry/pkg/v1/types"
-	"github.com/pkg/errors"
-	"github.com/sigstore/cosign/pkg/cosign/bundle"
+	"github.com/sigstore/cosign/v2/pkg/cosign/bundle"
 )
 
 func mustDecode(s string) []byte {
@@ -50,6 +52,7 @@ func TestSignature(t *testing.T) {
 	tests := []struct {
 		name           string
 		l              *sigLayer
+		env            map[string]string
 		wantPayloadErr error
 		wantSig        string
 		wantSigErr     error
@@ -222,6 +225,213 @@ Hr/+CxFvaJWmpYqNkLDGRU+9orzh5hI2RrcuaQ==
 		},
 		wantSig:   "blah",
 		wantChain: 1,
+	}, {
+		name: "payload size exceeds default limit",
+		l: &sigLayer{
+			Layer: &mockLayer{size: 134217728 + 42}, // 128MB + 42 bytes
+		},
+		wantPayloadErr: errors.New("size of layer (134217770) exceeded the limit (134217728)"),
+	}, {
+		name: "payload size exceeds overridden limit",
+		l: &sigLayer{
+			Layer: &mockLayer{size: 1000000000 + 42}, // 1GB + 42 bytes
+		},
+		env:            map[string]string{"COSIGN_MAX_ATTACHMENT_SIZE": "1GB"},
+		wantPayloadErr: errors.New("size of layer (1000000042) exceeded the limit (1000000000)"),
+	}, {
+		name: "payload size is within overridden limit",
+		l: &sigLayer{
+			Layer: layer,
+			desc: v1.Descriptor{
+				Digest: digest,
+				Annotations: map[string]string{
+					sigkey: "blah",
+				},
+			},
+		},
+		env:     map[string]string{"COSIGN_MAX_ATTACHMENT_SIZE": "5KB"},
+		wantSig: "blah",
+	}}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			for k, v := range test.env {
+				t.Setenv(k, v)
+			}
+			b, err := test.l.Payload()
+			switch {
+			case (err != nil) != (test.wantPayloadErr != nil):
+				t.Errorf("Payload() = %v, wanted %v", err, test.wantPayloadErr)
+			case (err != nil) && (test.wantPayloadErr != nil) && err.Error() != test.wantPayloadErr.Error():
+				t.Errorf("Payload() = %v, wanted %v", err, test.wantPayloadErr)
+			case err == nil:
+				if got, _, err := v1.SHA256(bytes.NewBuffer(b)); err != nil {
+					t.Errorf("v1.SHA256() = %v", err)
+				} else if want := digest; want != got {
+					t.Errorf("v1.SHA256() = %v, wanted %v", got, want)
+				}
+			}
+			if err != nil {
+				return
+			}
+
+			switch got, err := test.l.Base64Signature(); {
+			case (err != nil) != (test.wantSigErr != nil):
+				t.Errorf("Base64Signature() = %v, wanted %v", err, test.wantSigErr)
+			case (err != nil) && (test.wantSigErr != nil) && err.Error() != test.wantSigErr.Error():
+				t.Errorf("Base64Signature() = %v, wanted %v", err, test.wantSigErr)
+			case got != test.wantSig:
+				t.Errorf("Base64Signature() = %v, wanted %v", got, test.wantSig)
+			}
+
+			switch got, err := test.l.Cert(); {
+			case (err != nil) != (test.wantCertErr != nil):
+				t.Errorf("Cert() = %v, wanted %v", err, test.wantCertErr)
+			case (err != nil) && (test.wantCertErr != nil) && err.Error() != test.wantCertErr.Error():
+				t.Errorf("Cert() = %v, wanted %v", err, test.wantCertErr)
+			case (got != nil) != test.wantCert:
+				t.Errorf("Cert() = %v, wanted cert? %v", got, test.wantCert)
+			}
+
+			switch got, err := test.l.Chain(); {
+			case (err != nil) != (test.wantChainErr != nil):
+				t.Errorf("Chain() = %v, wanted %v", err, test.wantChainErr)
+			case (err != nil) && (test.wantChainErr != nil) && err.Error() != test.wantChainErr.Error():
+				t.Errorf("Chain() = %v, wanted %v", err, test.wantChainErr)
+			case len(got) != test.wantChain:
+				t.Errorf("Chain() = %v, wanted chain of length %d", got, test.wantChain)
+			}
+
+			switch got, err := test.l.Bundle(); {
+			case (err != nil) != (test.wantBundleErr != nil):
+				t.Errorf("Bundle() = %v, wanted %v", err, test.wantBundleErr)
+			case (err != nil) && (test.wantBundleErr != nil) && err.Error() != test.wantBundleErr.Error():
+				t.Errorf("Bundle() = %v, wanted %v", err, test.wantBundleErr)
+			case !cmp.Equal(got, test.wantBundle):
+				t.Errorf("Bundle() %s", cmp.Diff(got, test.wantBundle))
+			}
+		})
+	}
+}
+
+func TestSignatureWithTSAAnnotation(t *testing.T) {
+	layer, err := random.Layer(300 /* byteSize */, types.DockerLayer)
+	if err != nil {
+		t.Fatalf("random.Layer() = %v", err)
+	}
+	digest, err := layer.Digest()
+	if err != nil {
+		t.Fatalf("Digest() = %v", err)
+	}
+
+	tests := []struct {
+		name           string
+		l              *sigLayer
+		wantPayloadErr error
+		wantSig        string
+		wantSigErr     error
+		wantCert       bool
+		wantCertErr    error
+		wantChain      int
+		wantChainErr   error
+		wantBundle     *bundle.RFC3161Timestamp
+		wantBundleErr  error
+	}{{
+		name: "just payload and signature",
+		l: &sigLayer{
+			Layer: layer,
+			desc: v1.Descriptor{
+				Digest: digest,
+				Annotations: map[string]string{
+					sigkey: "blah",
+				},
+			},
+		},
+		wantSig: "blah",
+	}, {
+		name: "with empty other keys",
+		l: &sigLayer{
+			Layer: layer,
+			desc: v1.Descriptor{
+				Digest: digest,
+				Annotations: map[string]string{
+					sigkey:              "blah",
+					certkey:             "",
+					chainkey:            "",
+					RFC3161TimestampKey: "",
+				},
+			},
+		},
+		wantSig: "blah",
+	}, {
+		name: "missing signature",
+		l: &sigLayer{
+			Layer: layer,
+			desc: v1.Descriptor{
+				Digest: digest,
+			},
+		},
+		wantSigErr: fmt.Errorf("signature layer %s is missing %q annotation", digest, sigkey),
+	}, {
+		name: "min plus bad bundle",
+		l: &sigLayer{
+			Layer: layer,
+			desc: v1.Descriptor{
+				Digest: digest,
+				Annotations: map[string]string{
+					sigkey:              "blah",
+					RFC3161TimestampKey: `}`,
+				},
+			},
+		},
+		wantSig:       "blah",
+		wantBundleErr: errors.New(`unmarshaling RFC3161 timestamp bundle: invalid character '}' looking for beginning of value`),
+	}, {
+		name: "min plus bad cert",
+		l: &sigLayer{
+			Layer: layer,
+			desc: v1.Descriptor{
+				Digest: digest,
+				Annotations: map[string]string{
+					sigkey:  "blah",
+					certkey: `GARBAGE`,
+				},
+			},
+		},
+		wantSig:     "blah",
+		wantCertErr: errors.New(`error during PEM decoding`),
+	}, {
+		name: "min plus bad chain",
+		l: &sigLayer{
+			Layer: layer,
+			desc: v1.Descriptor{
+				Digest: digest,
+				Annotations: map[string]string{
+					sigkey:   "blah",
+					chainkey: `GARBAGE`,
+				},
+			},
+		},
+		wantSig:      "blah",
+		wantChainErr: errors.New(`error during PEM decoding`),
+	}, {
+		name: "min plus RFC3161 timestamp bundle",
+		l: &sigLayer{
+			Layer: layer,
+			desc: v1.Descriptor{
+				Digest: digest,
+				Annotations: map[string]string{
+					sigkey: "TSA blah",
+					// This was extracted from gcr.io/distroless/static:nonroot on 2021/09/16.
+					// The Body has been removed for brevity
+					RFC3161TimestampKey: `{"SignedRFC3161Timestamp":"MEUCIQClUkUqZNf+6dxBc/pxq22JIluTB7Kmip1G0FIF5E0C1wIgLqXm+IM3JYW/P/qjMZSXW+J8bt5EOqNfe3R+0A9ooFE="}`,
+				},
+			},
+		},
+		wantSig: "TSA blah",
+		wantBundle: &bundle.RFC3161Timestamp{
+			SignedRFC3161Timestamp: mustDecode("MEUCIQClUkUqZNf+6dxBc/pxq22JIluTB7Kmip1G0FIF5E0C1wIgLqXm+IM3JYW/P/qjMZSXW+J8bt5EOqNfe3R+0A9ooFE="),
+		},
 	}}
 
 	for _, test := range tests {
@@ -267,14 +477,31 @@ Hr/+CxFvaJWmpYqNkLDGRU+9orzh5hI2RrcuaQ==
 				t.Errorf("Chain() = %v, wanted chain of length %d", got, test.wantChain)
 			}
 
-			switch got, err := test.l.Bundle(); {
+			switch got, err := test.l.RFC3161Timestamp(); {
 			case (err != nil) != (test.wantBundleErr != nil):
-				t.Errorf("Bundle() = %v, wanted %v", err, test.wantBundleErr)
+				t.Errorf("RFC3161Timestamp() = %v, wanted %v", err, test.wantBundleErr)
 			case (err != nil) && (test.wantBundleErr != nil) && err.Error() != test.wantBundleErr.Error():
-				t.Errorf("Bundle() = %v, wanted %v", err, test.wantBundleErr)
+				t.Errorf("RFC3161Timestamp() = %v, wanted %v", err, test.wantBundleErr)
 			case !cmp.Equal(got, test.wantBundle):
-				t.Errorf("Bundle() %s", cmp.Diff(got, test.wantBundle))
+				t.Errorf("RFC3161Timestamp() %s", cmp.Diff(got, test.wantBundle))
 			}
 		})
 	}
 }
+
+type mockLayer struct {
+	size int64
+}
+
+func (m *mockLayer) Size() (int64, error) {
+	return m.size, nil
+}
+
+func (m *mockLayer) Compressed() (io.ReadCloser, error) {
+	return io.NopCloser(strings.NewReader("data")), nil
+}
+
+func (m *mockLayer) Digest() (v1.Hash, error)             { panic("not implemented") }
+func (m *mockLayer) DiffID() (v1.Hash, error)             { panic("not implemented") }
+func (m *mockLayer) Uncompressed() (io.ReadCloser, error) { panic("not implemented") }
+func (m *mockLayer) MediaType() (types.MediaType, error)  { panic("not implemented") }

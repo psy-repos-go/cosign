@@ -17,12 +17,14 @@ package cli
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/google/go-containerregistry/pkg/name"
-	"github.com/pkg/errors"
-	"github.com/sigstore/cosign/cmd/cosign/cli/options"
-	"github.com/sigstore/cosign/pkg/oci/layout"
-	"github.com/sigstore/cosign/pkg/oci/remote"
+
+	"github.com/sigstore/cosign/v2/cmd/cosign/cli/options"
+	"github.com/sigstore/cosign/v2/pkg/oci/layout"
+	"github.com/sigstore/cosign/v2/pkg/oci/remote"
+
 	"github.com/spf13/cobra"
 )
 
@@ -30,11 +32,12 @@ func Load() *cobra.Command {
 	o := &options.LoadOptions{}
 
 	cmd := &cobra.Command{
-		Use:     "load",
-		Short:   "Load a signed image on disk to a remote registry",
-		Long:    "Load a signed image on disk to a remote registry",
-		Example: `  cosign load --dir <path to directory> <IMAGE>`,
-		Args:    cobra.ExactArgs(1),
+		Use:              "load",
+		Short:            "Load a signed image on disk to a remote registry",
+		Long:             "Load a signed image on disk to a remote registry",
+		Example:          `  cosign load --dir <path to directory> <IMAGE>`,
+		Args:             cobra.ExactArgs(1),
+		PersistentPreRun: options.BindViper,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return LoadCmd(cmd.Context(), *o, args[0])
 		},
@@ -47,13 +50,19 @@ func Load() *cobra.Command {
 func LoadCmd(ctx context.Context, opts options.LoadOptions, imageRef string) error {
 	ref, err := name.ParseReference(imageRef)
 	if err != nil {
-		return errors.Wrapf(err, "parsing image name %s", imageRef)
+		return fmt.Errorf("parsing image name %s: %w", imageRef, err)
 	}
 
 	// get the signed image from disk
 	sii, err := layout.SignedImageIndex(opts.Directory)
 	if err != nil {
-		return errors.Wrap(err, "signed image index")
+		return fmt.Errorf("signed image index: %w", err)
 	}
-	return remote.WriteSignedImageIndexImages(ref, sii)
+
+	ociremoteOpts, err := opts.Registry.ClientOpts(ctx)
+	if err != nil {
+		return err
+	}
+
+	return remote.WriteSignedImageIndexImages(ref, sii, ociremoteOpts...)
 }

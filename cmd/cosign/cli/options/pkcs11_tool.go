@@ -16,6 +16,7 @@
 package options
 
 import (
+	"github.com/sigstore/cosign/v2/pkg/cosign/env"
 	"github.com/spf13/cobra"
 )
 
@@ -28,8 +29,9 @@ var _ Interface = (*PKCS11ToolListTokensOptions)(nil)
 
 // AddFlags implements Interface
 func (o *PKCS11ToolListTokensOptions) AddFlags(cmd *cobra.Command) {
-	cmd.Flags().StringVar(&o.ModulePath, "module-path", "",
+	cmd.Flags().StringVar(&o.ModulePath, "module-path", env.Getenv(env.VariablePKCS11ModulePath),
 		"absolute path to the PKCS11 module")
+	_ = cmd.Flags().SetAnnotation("module-path", cobra.BashCompFilenameExt, []string{})
 }
 
 // PKCS11ToolListKeysUrisOptions is the wrapper for `pkcs11-tool list-keys-uris` related options.
@@ -43,8 +45,9 @@ var _ Interface = (*PKCS11ToolListKeysUrisOptions)(nil)
 
 // AddFlags implements Interface
 func (o *PKCS11ToolListKeysUrisOptions) AddFlags(cmd *cobra.Command) {
-	cmd.Flags().StringVar(&o.ModulePath, "module-path", "",
+	cmd.Flags().StringVar(&o.ModulePath, "module-path", env.Getenv(env.VariablePKCS11ModulePath),
 		"absolute path to the PKCS11 module")
+	_ = cmd.Flags().SetAnnotation("module-path", cobra.BashCompFilenameExt, []string{})
 
 	cmd.Flags().UintVar(&o.SlotID, "slot-id", 0,
 		"id of the PKCS11 slot, uses 0 if empty")

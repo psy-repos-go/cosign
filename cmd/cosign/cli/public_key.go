@@ -20,9 +20,9 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/sigstore/cosign/cmd/cosign/cli/generate"
-	"github.com/sigstore/cosign/cmd/cosign/cli/options"
-	"github.com/sigstore/cosign/cmd/cosign/cli/publickey"
+	"github.com/sigstore/cosign/v2/cmd/cosign/cli/generate"
+	"github.com/sigstore/cosign/v2/cmd/cosign/cli/options"
+	"github.com/sigstore/cosign/v2/cmd/cosign/cli/publickey"
 )
 
 func PublicKey() *cobra.Command {
@@ -52,17 +52,18 @@ func PublicKey() *cobra.Command {
   cosign public-key --key hashivault://[KEY]
 
   # extract public key from GitLab with project name
-  cosign verify --key gitlab://[OWNER]/[PROJECT_NAME] <IMAGE>
+  cosign public-key --key gitlab://[OWNER]/[PROJECT_NAME] <IMAGE>
 
   # extract public key from GitLab with project id
-  cosign verify --key gitlab://[PROJECT_ID] <IMAGE>`,
-		PreRunE: func(cmd *cobra.Command, args []string) error {
+  cosign public-key --key gitlab://[PROJECT_ID] <IMAGE>`,
+		PreRunE: func(_ *cobra.Command, _ []string) error {
 			if !options.OneOf(o.Key, o.SecurityKey.Use) {
 				return &options.KeyParseError{}
 			}
 			return nil
 		},
-		RunE: func(cmd *cobra.Command, args []string) error {
+		PersistentPreRun: options.BindViper,
+		RunE: func(cmd *cobra.Command, _ []string) error {
 			writer := publickey.NamedWriter{Name: "", Writer: nil}
 			var f *os.File
 			// Open output file for public key if specified.

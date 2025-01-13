@@ -16,14 +16,15 @@
 package options
 
 import (
-	"github.com/sigstore/cosign/pkg/cosign/tuf"
+	"github.com/sigstore/sigstore/pkg/tuf"
 	"github.com/spf13/cobra"
 )
 
 // InitializeOptions is the top level wrapper for the initialize command.
 type InitializeOptions struct {
-	Mirror string
-	Root   string
+	Mirror       string
+	Root         string
+	RootChecksum string
 }
 
 var _ Interface = (*InitializeOptions)(nil)
@@ -31,8 +32,12 @@ var _ Interface = (*InitializeOptions)(nil)
 // AddFlags implements Interface
 func (o *InitializeOptions) AddFlags(cmd *cobra.Command) {
 	cmd.Flags().StringVar(&o.Mirror, "mirror", tuf.DefaultRemoteRoot,
-		"GCS bucket to a SigStore TUF repository or HTTP(S) base URL")
+		"GCS bucket to a SigStore TUF repository, or HTTP(S) base URL, or file:/// for local filestore remote (air-gap)")
 
 	cmd.Flags().StringVar(&o.Root, "root", "",
 		"path to trusted initial root. defaults to embedded root")
+	_ = cmd.Flags().SetAnnotation("root", cobra.BashCompSubdirsInDir, []string{})
+
+	cmd.Flags().StringVar(&o.RootChecksum, "root-checksum", "",
+		"checksum of the initial root, required if root is downloaded via http(s). expects sha256 by default, can be changed to sha512 by providing sha512:<checksum>")
 }

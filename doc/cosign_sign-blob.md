@@ -12,10 +12,13 @@ cosign sign-blob [flags]
   cosign sign-blob --key <key path>|<kms uri> <blob>
 
   # sign a blob with Google sign-in (experimental)
-  COSIGN_EXPERIMENTAL=1 cosign --timeout 90s sign-blob <FILE>
+  cosign sign-blob <FILE> --output-signature <FILE> --output-certificate <FILE>
 
   # sign a blob with a local key pair file
   cosign sign-blob --key cosign.key <FILE>
+
+  # sign a blob with a key stored in an environment variable
+  cosign sign-blob --key env://[ENV_VAR] <FILE>
 
   # sign a blob with a key pair stored in Azure Key Vault
   cosign sign-blob --key azurekms://[VAULT_NAME][VAULT_URI]/[KEY] <FILE>
@@ -33,25 +36,36 @@ cosign sign-blob [flags]
 ### Options
 
 ```
-      --allow-insecure-registry                                                                  whether to allow insecure connections to registries. Don't use this for anything but testing
-      --attachment-tag-prefix [AttachmentTagPrefix]sha256-[TargetImageDigest].[AttachmentName]   optional custom prefix to use for attached image tags. Attachment images are tagged as: [AttachmentTagPrefix]sha256-[TargetImageDigest].[AttachmentName]
-      --b64                                                                                      whether to base64 encode the output (default true)
-      --bundle string                                                                            write everything required to verify the blob to a FILE
-      --fulcio-url string                                                                        [EXPERIMENTAL] address of sigstore PKI server (default "https://v1.fulcio.sigstore.dev")
-  -h, --help                                                                                     help for sign-blob
-      --identity-token string                                                                    [EXPERIMENTAL] identity token to use for certificate from fulcio
-      --insecure-skip-verify                                                                     [EXPERIMENTAL] skip verifying fulcio published to the SCT (this should only be used for testing).
-      --k8s-keychain                                                                             whether to use the kubernetes keychain instead of the default keychain (supports workload identity).
-      --key string                                                                               path to the private key file, KMS URI or Kubernetes Secret
-      --oidc-client-id string                                                                    [EXPERIMENTAL] OIDC client ID for application (default "sigstore")
-      --oidc-client-secret string                                                                [EXPERIMENTAL] OIDC client secret for application
-      --oidc-issuer string                                                                       [EXPERIMENTAL] OIDC provider to be used to issue ID token (default "https://oauth2.sigstore.dev/auth")
-      --output string                                                                            write the signature to FILE
-      --output-certificate string                                                                write the certificate to FILE
-      --output-signature string                                                                  write the signature to FILE
-      --rekor-url string                                                                         [EXPERIMENTAL] address of rekor STL server (default "https://rekor.sigstore.dev")
-      --sk                                                                                       whether to use a hardware security key
-      --slot string                                                                              security key slot to use for generated key (default: signature) (authentication|signature|card-authentication|key-management)
+      --b64                              whether to base64 encode the output (default true)
+      --bundle string                    write everything required to verify the blob to a FILE
+      --fulcio-auth-flow string          fulcio interactive oauth2 flow to use for certificate from fulcio. Defaults to determining the flow based on the runtime environment. (options) normal|device|token|client_credentials
+      --fulcio-url string                address of sigstore PKI server (default "https://fulcio.sigstore.dev")
+  -h, --help                             help for sign-blob
+      --identity-token string            identity token to use for certificate from fulcio. the token or a path to a file containing the token is accepted.
+      --insecure-skip-verify             skip verifying fulcio published to the SCT (this should only be used for testing).
+      --issue-certificate                issue a code signing certificate from Fulcio, even if a key is provided
+      --key string                       path to the private key file, KMS URI or Kubernetes Secret
+      --new-bundle-format                output bundle in new format that contains all verification material
+      --oidc-client-id string            OIDC client ID for application (default "sigstore")
+      --oidc-client-secret-file string   Path to file containing OIDC client secret for application
+      --oidc-disable-ambient-providers   Disable ambient OIDC providers. When true, ambient credentials will not be read
+      --oidc-issuer string               OIDC provider to be used to issue ID token (default "https://oauth2.sigstore.dev/auth")
+      --oidc-provider string             Specify the provider to get the OIDC token from (Optional). If unset, all options will be tried. Options include: [spiffe, google, github-actions, filesystem, buildkite-agent]
+      --oidc-redirect-url string         OIDC redirect URL (Optional). The default oidc-redirect-url is 'http://localhost:0/auth/callback'.
+      --output string                    write the signature to FILE
+      --output-certificate string        write the certificate to FILE
+      --output-signature string          write the signature to FILE
+      --rekor-url string                 address of rekor STL server (default "https://rekor.sigstore.dev")
+      --rfc3161-timestamp string         write the RFC3161 timestamp to a file
+      --sk                               whether to use a hardware security key
+      --slot string                      security key slot to use for generated key (default: signature) (authentication|signature|card-authentication|key-management)
+      --timestamp-client-cacert string   path to the X.509 CA certificate file in PEM format to be used for the connection to the TSA Server
+      --timestamp-client-cert string     path to the X.509 certificate file in PEM format to be used for the connection to the TSA Server
+      --timestamp-client-key string      path to the X.509 private key file in PEM format to be used, together with the 'timestamp-client-cert' value, for the connection to the TSA Server
+      --timestamp-server-name string     SAN name to use as the 'ServerName' tls.Config field to verify the mTLS connection to the TSA Server
+      --timestamp-server-url string      url to the Timestamp RFC3161 server, default none. Must be the path to the API to request timestamp responses, e.g. https://freetsa.org/tsr
+      --tlog-upload                      whether or not to upload to the tlog (default true)
+  -y, --yes                              skip confirmation prompts for non-destructive operations
 ```
 
 ### Options inherited from parent commands
@@ -64,5 +78,5 @@ cosign sign-blob [flags]
 
 ### SEE ALSO
 
-* [cosign](cosign.md)	 - 
+* [cosign](cosign.md)	 - A tool for Container Signing, Verification and Storage in an OCI registry.
 

@@ -25,12 +25,13 @@ import (
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"syscall"
 
-	"github.com/go-piv/piv-go/piv"
-	"github.com/pkg/errors"
+	"github.com/go-piv/piv-go/v2/piv"
 	"golang.org/x/term"
 
 	"github.com/sigstore/sigstore/pkg/signature"
@@ -71,7 +72,7 @@ func GetKey() (*Key, error) {
 func GetKeyWithSlot(slot string) (*Key, error) {
 	card, err := GetKey()
 	if err != nil {
-		return nil, errors.Wrap(err, "open key")
+		return nil, fmt.Errorf("open key: %w", err)
 	}
 
 	card.slot = SlotForName(slot)
@@ -112,7 +113,7 @@ func (k *Key) GetAttestationCertificate() (*x509.Certificate, error) {
 	return k.card.AttestationCertificate()
 }
 
-func (k *Key) SetManagementKey(old, new [24]byte) error {
+func (k *Key) SetManagementKey(old, new []byte) error {
 	if k.card == nil {
 		return KeyNotInitialized
 	}
@@ -152,7 +153,7 @@ func (k *Key) Unblock(puk, newPIN string) error {
 	return k.card.Unblock(puk, newPIN)
 }
 
-func (k *Key) GenerateKey(mgmtKey [24]byte, slot piv.Slot, opts piv.Key) (crypto.PublicKey, error) {
+func (k *Key) GenerateKey(mgmtKey []byte, slot piv.Slot, opts piv.Key) (crypto.PublicKey, error) {
 	if k.card == nil {
 		return nil, KeyNotInitialized
 	}
@@ -167,17 +168,17 @@ func (k *Key) PublicKey(opts ...signature.PublicKeyOption) (crypto.PublicKey, er
 func (k *Key) VerifySignature(signature, message io.Reader, opts ...signature.VerifyOption) error {
 	sig, err := io.ReadAll(signature)
 	if err != nil {
-		return errors.Wrap(err, "read signature")
+		return fmt.Errorf("read signature: %w", err)
 	}
 	msg, err := io.ReadAll(message)
 	if err != nil {
-		return errors.Wrap(err, "read message")
+		return fmt.Errorf("read message: %w", err)
 	}
 	digest := sha256.Sum256(msg)
 
 	att, err := k.Attest()
 	if err != nil {
-		return errors.Wrap(err, "get attestation")
+		return fmt.Errorf("get attestation: %w", err)
 	}
 	switch kt := att.PublicKey.(type) {
 	case *ecdsa.PublicKey:
@@ -194,7 +195,9 @@ func (k *Key) VerifySignature(signature, message io.Reader, opts ...signature.Ve
 
 func getPin() (string, error) {
 	fmt.Fprint(os.Stderr, "Enter PIN for security key: ")
-	b, err := term.ReadPassword(0)
+	// Unnecessary convert of syscall.Stdin on *nix, but Windows is a uintptr
+	// nolint:unconvert
+	b, err := term.ReadPassword(int(syscall.Stdin))
 	if err != nil {
 		return "", err
 	}

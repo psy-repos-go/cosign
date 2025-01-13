@@ -16,10 +16,15 @@ package signature
 
 import (
 	"context"
+	"crypto"
+	"errors"
 	"os"
 	"testing"
 
-	"github.com/sigstore/cosign/pkg/cosign"
+	"github.com/sigstore/cosign/v2/pkg/blob"
+	"github.com/sigstore/cosign/v2/pkg/cosign"
+	sigsignature "github.com/sigstore/sigstore/pkg/signature"
+	"github.com/sigstore/sigstore/pkg/signature/kms"
 )
 
 func generateKeyFile(t *testing.T, tmpDir string, pf cosign.PassFunc) (privFile, pubFile string) {
@@ -76,6 +81,7 @@ func TestSignerFromPrivateKeyFileRef(t *testing.T) {
 	}}
 	for _, tc := range testCases {
 		t.Run(tc.desc, func(t *testing.T) {
+			tc := tc
 			t.Parallel()
 			testFile, _ := generateKeyFile(t, tmpDir, tc.writePw)
 
@@ -102,6 +108,57 @@ func TestPublicKeyFromFileRef(t *testing.T) {
 
 	if _, err := PublicKeyFromKeyRef(ctx, testFile); err != nil {
 		t.Fatalf("PublicKeyFromKeyRef returned error: %v", err)
+	}
+}
+
+func TestPublicKeyFromEnvVar(t *testing.T) {
+	keys, err := cosign.GenerateKeyPair(pass("whatever"))
+	if err != nil {
+		t.Fatalf("failed to generate keypair: %v", err)
+	}
+	ctx := context.Background()
+
+	os.Setenv("MY_ENV_VAR", string(keys.PublicBytes))
+	defer os.Unsetenv("MY_ENV_VAR")
+	if _, err := PublicKeyFromKeyRef(ctx, "env://MY_ENV_VAR"); err != nil {
+		t.Fatalf("PublicKeyFromKeyRef returned error: %v", err)
+	}
+}
+
+func TestSignerVerifierFromEnvVar(t *testing.T) {
+	passFunc := pass("whatever")
+	keys, err := cosign.GenerateKeyPair(passFunc)
+	if err != nil {
+		t.Fatalf("failed to generate keypair: %v", err)
+	}
+	ctx := context.Background()
+
+	os.Setenv("MY_ENV_VAR", string(keys.PrivateBytes))
+	defer os.Unsetenv("MY_ENV_VAR")
+	if _, err := SignerVerifierFromKeyRef(ctx, "env://MY_ENV_VAR", passFunc); err != nil {
+		t.Fatalf("SignerVerifierFromKeyRef returned error: %v", err)
+	}
+}
+
+func TestVerifierForKeyRefError(t *testing.T) {
+	kms.AddProvider("errorkms://", func(_ context.Context, _ string, _ crypto.Hash, _ ...sigsignature.RPCOption) (kms.SignerVerifier, error) {
+		return nil, errors.New("bad")
+	})
+	var uerr *blob.UnrecognizedSchemeError
+
+	ctx := context.Background()
+	_, err := PublicKeyFromKeyRef(ctx, "errorkms://bad")
+	if err == nil {
+		t.Fatalf("PublicKeyFromKeyRef didn't return any error")
+	} else if errors.As(err, &uerr) {
+		t.Fatalf("PublicKeyFromKeyRef returned UnrecognizedSchemeError: %v", err)
+	}
+
+	_, err = PublicKeyFromKeyRef(ctx, "badscheme://bad")
+	if err == nil {
+		t.Fatalf("PublicKeyFromKeyRef didn't return any error")
+	} else if !errors.As(err, &uerr) {
+		t.Fatalf("PublicKeyFromKeyRef didn't return UnrecognizedSchemeError: %v", err)
 	}
 }
 

@@ -1,0 +1,182 @@
+# Copyright 2022 The Sigstore Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Test attest / verify-attestation
+
+on:
+  pull_request:
+    branches: [ 'main', 'release-*' ]
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash
+
+permissions: {}
+
+jobs:
+  cip-test:
+    name: attest / verify-attestation test
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        k8s-version:
+        - v1.27.x
+        tuf-root:
+        - remote
+        - air-gap
+
+    permissions:
+      contents: read
+
+    env:
+      KO_DOCKER_REPO: "registry.local:5000/policy-controller"
+      SCAFFOLDING_RELEASE_VERSION: "v0.7.11"
+      GO111MODULE: on
+      GOFLAGS: -ldflags=-s -ldflags=-w
+      KOCACHE: ~/ko
+      COSIGN_YES: "true"
+
+    steps:
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      with:
+        persist-credentials: false
+    - uses: actions/setup-go@3041bf56c941b39c61721a86cd11f3bb1338122a # v5.2.0
+      with:
+        go-version-file: 'go.mod'
+        check-latest: true
+
+    # will use the latest release available for ko
+    - uses: ko-build/setup-ko@3aebd0597dc1e9d1a26bcfdb7cbeb19c131d3037 # v0.7
+
+    - name: Install yq
+      uses: mikefarah/yq@4839dbbf80445070a31c7a9c1055da527db2d5ee # v4.44.6
+
+    - name: build cosign
+      run: |
+        make cosign
+
+    - name: Install cluster + sigstore
+      uses: sigstore/scaffolding/actions/setup@main
+      with:
+        legacy-variables: "false"
+        k8s-version: ${{ matrix.k8s-version }}
+        version: ${{ env.SCAFFOLDING_RELEASE_VERSION }}
+
+    - name: Create sample image - demoimage
+      run: |
+        pushd $(mktemp -d)
+        go mod init example.com/demo
+        cat <<EOF > main.go
+        package main
+        import "fmt"
+        func main() {
+          fmt.Println("hello world")
+        }
+        EOF
+        demoimage=`ko publish -B example.com/demo`
+        echo "demoimage=$demoimage" >> $GITHUB_ENV
+        echo Created image $demoimage
+        popd
+
+    - name: Initialize with our custom TUF root pointing to remote root
+      if: ${{ matrix.tuf-root == 'remote' }}
+      run: |
+        TUF_MIRROR=$(kubectl -n tuf-system get ksvc tuf -ojsonpath='{.status.url}')
+        ./cosign initialize --mirror $TUF_MIRROR --root ./root.json
+
+    - name: Initialize with custom TUF root pointing to local filesystem
+      if: ${{ matrix.tuf-root == 'air-gap' }}
+      run: |
+        # Grab the compressed repository for airgap testing.
+        kubectl -n tuf-system get secrets tuf-root -ojsonpath='{.data.repository}'  | base64 -d > ./repository.tar.gz
+        tar -zxvf ./repository.tar.gz
+        PWD=$(pwd)
+        ROOT=${PWD}/repository/1.root.json
+        REPOSITORY=${PWD}/repository
+        ./cosign initialize --root ${ROOT} --mirror file://${REPOSITORY}
+
+    - name: Sign demoimage with cosign
+      run: |
+        ./cosign sign --rekor-url ${REKOR_URL} --fulcio-url ${FULCIO_URL} --yes --allow-insecure-registry ${demoimage} --identity-token ${OIDC_TOKEN}
+
+    - name: Create attestation for it
+      run: |
+        echo -n 'foobar e2e test' > ./predicate-file
+        ./cosign attest --predicate ./predicate-file --fulcio-url ${FULCIO_URL} --rekor-url ${REKOR_URL} --allow-insecure-registry --yes ${demoimage} --identity-token ${OIDC_TOKEN}
+
+    - name: Sign a blob
+      run: |
+        ./cosign sign-blob README.md --fulcio-url ${FULCIO_URL} --rekor-url ${REKOR_URL} --output-certificate cert.pem --output-signature sig --yes --identity-token ${OIDC_TOKEN}
+
+    - name: Verify with cosign
+      run: |
+        ./cosign verify --rekor-url ${REKOR_URL} --allow-insecure-registry ${demoimage} --certificate-identity https://kubernetes.io/namespaces/default/serviceaccounts/default --certificate-oidc-issuer "https://kubernetes.default.svc.cluster.local"
+
+    - name: Verify custom attestation with cosign, works
+      run: |
+        echo '::group:: test custom verify-attestation success'
+        if ! ./cosign verify-attestation --certificate-identity https://kubernetes.io/namespaces/default/serviceaccounts/default --certificate-oidc-issuer "https://kubernetes.default.svc.cluster.local" --policy ./test/testdata/policies/cue-works.cue --rekor-url ${REKOR_URL} --allow-insecure-registry ${demoimage} ; then
+          echo Failed to verify attestation with a valid policy
+          exit 1
+        else
+          echo Successfully validated custom attestation with a valid policy
+        fi
+        echo '::endgroup::'
+
+    - name: Verify custom attestation with cosign, fails
+      run: |
+        echo '::group:: test custom verify-attestation success'
+        if ./cosign verify-attestation --policy ./test/testdata/policies/cue-fails.cue --rekor-url ${REKOR_URL} --allow-insecure-registry ${demoimage} --certificate-identity https://kubernetes.io/namespaces/default/serviceaccounts/default --certificate-oidc-issuer "https://kubernetes.default.svc.cluster.local" ; then
+          echo custom verify-attestation succeeded with cue policy that should not work
+          exit 1
+        else
+          echo Successfully failed a policy that should not work
+        fi
+        echo '::endgroup::'
+
+    - name: Verify a blob
+      run: |
+        ./cosign verify-blob README.md --rekor-url ${REKOR_URL} --certificate ./cert.pem --signature sig --certificate-identity https://kubernetes.io/namespaces/default/serviceaccounts/default --certificate-oidc-issuer "https://kubernetes.default.svc.cluster.local"
+
+    - name: Collect diagnostics
+      if: ${{ failure() }}
+      uses: chainguard-dev/actions/kind-diag@9ba949ac63357c725a9438f3e05a1e33d313498e # main
+
+    - name: Create vuln attestation for it
+      run: |
+        ./cosign attest --predicate ./test/testdata/attestations/vuln-predicate.json --type vuln --fulcio-url ${FULCIO_URL} --rekor-url ${REKOR_URL} --allow-insecure-registry --yes ${demoimage} --identity-token ${OIDC_TOKEN}
+
+    - name: Verify vuln attestation with cosign, works
+      run: |
+        echo '::group:: test vuln verify-attestation success'
+        if ! ./cosign verify-attestation --type vuln --policy ./test/testdata/policies/cue-vuln-works.cue --rekor-url ${REKOR_URL} --allow-insecure-registry ${demoimage} --certificate-identity https://kubernetes.io/namespaces/default/serviceaccounts/default --certificate-oidc-issuer "https://kubernetes.default.svc.cluster.local" ; then
+          echo Failed to verify attestation with a valid policy
+          exit 1
+        else
+          echo Successfully validated vuln attestation with a valid policy
+        fi
+        echo '::endgroup::'
+
+    - name: Verify vuln attestation with cosign, fails
+      run: |
+        echo '::group:: test vuln verify-attestation success'
+        if ./cosign verify-attestation --type vuln --policy ./test/testdata/policies/cue-vuln-fails.cue --rekor-url ${REKOR_URL} --allow-insecure-registry ${demoimage} --certificate-identity https://kubernetes.io/namespaces/default/serviceaccounts/default --certificate-oidc-issuer "https://kubernetes.default.svc.cluster.local" ; then
+          echo verify-attestation succeeded with cue policy that should not work
+          exit 1
+        else
+          echo Successfully failed a policy that should not work
+        fi
+        echo '::endgroup::'

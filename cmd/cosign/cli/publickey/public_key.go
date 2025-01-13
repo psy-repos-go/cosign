@@ -19,14 +19,12 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"os"
 
-	"github.com/pkg/errors"
-
-	"github.com/sigstore/cosign/pkg/cosign"
-	"github.com/sigstore/cosign/pkg/cosign/pivkey"
-	"github.com/sigstore/cosign/pkg/cosign/pkcs11key"
-	sigs "github.com/sigstore/cosign/pkg/signature"
+	"github.com/sigstore/cosign/v2/internal/ui"
+	"github.com/sigstore/cosign/v2/pkg/cosign"
+	"github.com/sigstore/cosign/v2/pkg/cosign/pivkey"
+	"github.com/sigstore/cosign/v2/pkg/cosign/pkcs11key"
+	sigs "github.com/sigstore/cosign/v2/pkg/signature"
 	"github.com/sigstore/sigstore/pkg/signature"
 	signatureoptions "github.com/sigstore/sigstore/pkg/signature/options"
 )
@@ -58,12 +56,12 @@ func GetPublicKey(ctx context.Context, opts Pkopts, writer NamedWriter, pf cosig
 	case opts.Sk:
 		sk, err := pivkey.GetKeyWithSlot(opts.Slot)
 		if err != nil {
-			return errors.Wrap(err, "opening piv token")
+			return fmt.Errorf("opening piv token: %w", err)
 		}
 		defer sk.Close()
 		pk, err := sk.Verifier()
 		if err != nil {
-			return errors.Wrap(err, "initializing piv token verifier")
+			return fmt.Errorf("initializing piv token verifier: %w", err)
 		}
 		k = pk
 	}
@@ -77,7 +75,7 @@ func GetPublicKey(ctx context.Context, opts Pkopts, writer NamedWriter, pf cosig
 		return err
 	}
 	if writer.Name != "" {
-		fmt.Fprintln(os.Stderr, "Public key written to ", writer.Name)
+		ui.Infof(ctx, "Public key written to %s", writer.Name)
 	}
 	return nil
 }

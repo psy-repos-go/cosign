@@ -16,42 +16,30 @@
 package verify
 
 import (
-	"bytes"
 	"context"
 	"crypto"
-	"crypto/ecdsa"
-	_ "crypto/sha256" // for `crypto.SHA256`
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
-	"time"
+	"path/filepath"
 
-	"github.com/go-openapi/runtime"
-	"github.com/pkg/errors"
-	ssldsse "github.com/secure-systems-lab/go-securesystemslib/dsse"
-	"github.com/sigstore/cosign/cmd/cosign/cli/fulcio"
-	"github.com/sigstore/cosign/cmd/cosign/cli/options"
-	"github.com/sigstore/cosign/cmd/cosign/cli/rekor"
-	"github.com/sigstore/cosign/cmd/cosign/cli/sign"
-	"github.com/sigstore/cosign/pkg/blob"
-	"github.com/sigstore/cosign/pkg/cosign"
-	"github.com/sigstore/cosign/pkg/cosign/pivkey"
-	"github.com/sigstore/cosign/pkg/cosign/pkcs11key"
-	"github.com/sigstore/cosign/pkg/cosign/tuf"
-	sigs "github.com/sigstore/cosign/pkg/signature"
+	"github.com/sigstore/cosign/v2/cmd/cosign/cli/options"
+	"github.com/sigstore/cosign/v2/cmd/cosign/cli/rekor"
+	"github.com/sigstore/cosign/v2/internal/ui"
+	"github.com/sigstore/cosign/v2/pkg/blob"
+	"github.com/sigstore/cosign/v2/pkg/cosign"
+	"github.com/sigstore/cosign/v2/pkg/cosign/bundle"
+	"github.com/sigstore/cosign/v2/pkg/cosign/pivkey"
+	"github.com/sigstore/cosign/v2/pkg/cosign/pkcs11key"
+	"github.com/sigstore/cosign/v2/pkg/oci/static"
+	sigs "github.com/sigstore/cosign/v2/pkg/signature"
 
-	ctypes "github.com/sigstore/cosign/pkg/types"
-	"github.com/sigstore/rekor/pkg/generated/models"
-	"github.com/sigstore/rekor/pkg/types"
-	hashedrekord "github.com/sigstore/rekor/pkg/types/hashedrekord/v0.0.1"
-	rekord "github.com/sigstore/rekor/pkg/types/rekord/v0.0.1"
 	"github.com/sigstore/sigstore/pkg/cryptoutils"
-	"github.com/sigstore/sigstore/pkg/signature"
-	"github.com/sigstore/sigstore/pkg/signature/dsse"
-	signatureoptions "github.com/sigstore/sigstore/pkg/signature/options"
 )
 
 func isb64(data []byte) bool {
@@ -60,15 +48,65 @@ func isb64(data []byte) bool {
 }
 
 // nolint
-func VerifyBlobCmd(ctx context.Context, ko sign.KeyOpts, certRef, certEmail, certOidcIssuer, sigRef, blobRef string) error {
-	var verifier signature.Verifier
-	var cert *x509.Certificate
+type VerifyBlobCmd struct {
+	options.KeyOpts
+	options.CertVerifyOptions
+	CertRef                      string
+	CAIntermediates              string
+	CARoots                      string
+	CertChain                    string
+	SigRef                       string
+	TrustedRootPath              string
+	CertGithubWorkflowTrigger    string
+	CertGithubWorkflowSHA        string
+	CertGithubWorkflowName       string
+	CertGithubWorkflowRepository string
+	CertGithubWorkflowRef        string
+	IgnoreSCT                    bool
+	SCTRef                       string
+	Offline                      bool
+	UseSignedTimestamps          bool
+	IgnoreTlog                   bool
+}
 
-	if !options.OneOf(ko.KeyRef, ko.Sk, certRef) && !options.EnableExperimental() && ko.BundlePath == "" {
+// nolint
+func (c *VerifyBlobCmd) Exec(ctx context.Context, blobRef string) error {
+	// Require a certificate/key OR a local bundle file that has the cert.
+	if options.NOf(c.KeyRef, c.CertRef, c.Sk, c.BundlePath) == 0 {
+		return fmt.Errorf("provide a key with --key or --sk, a certificate to verify against with --certificate, or a bundle with --bundle")
+	}
+
+	// Key, sk, and cert are mutually exclusive.
+	if options.NOf(c.KeyRef, c.Sk, c.CertRef) > 1 {
 		return &options.PubKeyParseError{}
 	}
 
-	sig, b64sig, err := signatures(sigRef, ko.BundlePath)
+	if c.KeyOpts.NewBundleFormat || checkNewBundle(c.BundlePath) {
+		if options.NOf(c.RFC3161TimestampPath, c.TSACertChainPath, c.RekorURL, c.CertChain, c.CARoots, c.CAIntermediates, c.CertRef, c.SigRef, c.SCTRef) > 1 {
+			return fmt.Errorf("when using --new-bundle-format, please supply signed content with --bundle and verification content with --trusted-root")
+		}
+		_, err := verifyNewBundle(ctx, c.BundlePath, c.TrustedRootPath, c.KeyRef, c.Slot, c.CertVerifyOptions.CertOidcIssuer, c.CertVerifyOptions.CertOidcIssuerRegexp, c.CertVerifyOptions.CertIdentity, c.CertVerifyOptions.CertIdentityRegexp, c.CertGithubWorkflowTrigger, c.CertGithubWorkflowSHA, c.CertGithubWorkflowName, c.CertGithubWorkflowRepository, c.CertGithubWorkflowRef, blobRef, c.Sk, c.IgnoreTlog, c.UseSignedTimestamps, c.IgnoreSCT)
+		if err == nil {
+			ui.Infof(ctx, "Verified OK")
+		}
+		return err
+	} else if c.TrustedRootPath != "" {
+		return fmt.Errorf("--trusted-root only supported with --new-bundle-format")
+	}
+
+	var cert *x509.Certificate
+	opts := make([]static.Option, 0)
+
+	var identities []cosign.Identity
+	var err error
+	if c.KeyRef == "" {
+		identities, err = c.Identities()
+		if err != nil {
+			return err
+		}
+	}
+
+	sig, err := base64signature(c.SigRef, c.BundlePath)
 	if err != nil {
 		return err
 	}
@@ -78,149 +116,223 @@ func VerifyBlobCmd(ctx context.Context, ko sign.KeyOpts, certRef, certEmail, cer
 		return err
 	}
 
+	co := &cosign.CheckOpts{
+		CertGithubWorkflowTrigger:    c.CertGithubWorkflowTrigger,
+		CertGithubWorkflowSha:        c.CertGithubWorkflowSHA,
+		CertGithubWorkflowName:       c.CertGithubWorkflowName,
+		CertGithubWorkflowRepository: c.CertGithubWorkflowRepository,
+		CertGithubWorkflowRef:        c.CertGithubWorkflowRef,
+		IgnoreSCT:                    c.IgnoreSCT,
+		Identities:                   identities,
+		Offline:                      c.Offline,
+		IgnoreTlog:                   c.IgnoreTlog,
+		UseSignedTimestamps:          c.TSACertChainPath != "" || c.UseSignedTimestamps,
+	}
+
+	if c.RFC3161TimestampPath != "" && !co.UseSignedTimestamps {
+		return fmt.Errorf("when specifying --rfc3161-timestamp-path, you must also specify --use-signed-timestamps or --timestamp-certificate-chain")
+	} else if c.RFC3161TimestampPath == "" && co.UseSignedTimestamps {
+		return fmt.Errorf("when specifying --use-signed-timestamps or --timestamp-certificate-chain, you must also specify --rfc3161-timestamp-path")
+	}
+	if co.UseSignedTimestamps {
+		tsaCertificates, err := cosign.GetTSACerts(ctx, c.TSACertChainPath, cosign.GetTufTargets)
+		if err != nil {
+			return fmt.Errorf("unable to load TSA certificates: %w", err)
+		}
+		co.TSACertificate = tsaCertificates.LeafCert
+		co.TSARootCertificates = tsaCertificates.RootCert
+		co.TSAIntermediateCertificates = tsaCertificates.IntermediateCerts
+	}
+
+	if !c.IgnoreTlog {
+		if c.RekorURL != "" {
+			rekorClient, err := rekor.NewClient(c.RekorURL)
+			if err != nil {
+				return fmt.Errorf("creating Rekor client: %w", err)
+			}
+			co.RekorClient = rekorClient
+		}
+		// This performs an online fetch of the Rekor public keys, but this is needed
+		// for verifying tlog entries (both online and offline).
+		co.RekorPubKeys, err = cosign.GetRekorPubs(ctx)
+		if err != nil {
+			return fmt.Errorf("getting Rekor public keys: %w", err)
+		}
+	}
+
+	if keylessVerification(c.KeyRef, c.Sk) {
+		if err := loadCertsKeylessVerification(c.CertChain, c.CARoots, c.CAIntermediates, co); err != nil {
+			return err
+		}
+	}
+
 	// Keys are optional!
 	switch {
-	case ko.KeyRef != "":
-		verifier, err = sigs.PublicKeyFromKeyRef(ctx, ko.KeyRef)
+	case c.KeyRef != "":
+		co.SigVerifier, err = sigs.PublicKeyFromKeyRef(ctx, c.KeyRef)
 		if err != nil {
-			return errors.Wrap(err, "loading public key")
+			return fmt.Errorf("loading public key: %w", err)
 		}
-		pkcs11Key, ok := verifier.(*pkcs11key.Key)
+		pkcs11Key, ok := co.SigVerifier.(*pkcs11key.Key)
 		if ok {
 			defer pkcs11Key.Close()
 		}
-	case ko.Sk:
-		sk, err := pivkey.GetKeyWithSlot(ko.Slot)
+	case c.Sk:
+		sk, err := pivkey.GetKeyWithSlot(c.Slot)
 		if err != nil {
-			return errors.Wrap(err, "opening piv token")
+			return fmt.Errorf("opening piv token: %w", err)
 		}
 		defer sk.Close()
-		verifier, err = sk.Verifier()
+		co.SigVerifier, err = sk.Verifier()
 		if err != nil {
-			return errors.Wrap(err, "loading public key from token")
+			return fmt.Errorf("loading public key from token: %w", err)
 		}
-	case certRef != "":
-		cert, err = loadCertFromFileOrURL(certRef)
-		if err != nil {
-			return err
-		}
-		verifier, err = signature.LoadECDSAVerifier(cert.PublicKey.(*ecdsa.PublicKey), crypto.SHA256)
+	case c.CertRef != "":
+		cert, err = loadCertFromFileOrURL(c.CertRef)
 		if err != nil {
 			return err
 		}
-	case ko.BundlePath != "":
-		b, err := cosign.FetchLocalSignedPayloadFromPath(ko.BundlePath)
+	}
+	if c.BundlePath != "" {
+		b, err := cosign.FetchLocalSignedPayloadFromPath(c.BundlePath)
 		if err != nil {
 			return err
 		}
-		if b.Cert == "" {
+		// A certificate is required in the bundle unless we specified with
+		//  --key, --sk, or --certificate.
+		if b.Cert == "" && co.SigVerifier == nil && cert == nil {
 			return fmt.Errorf("bundle does not contain cert for verification, please provide public key")
 		}
-		// cert can either be a cert or public key
-		certBytes := []byte(b.Cert)
-		if isb64(certBytes) {
-			certBytes, _ = base64.StdEncoding.DecodeString(b.Cert)
+		// We have to condition on this because sign-blob may not output the signing
+		// key to the bundle when there is no tlog upload.
+		if b.Cert != "" {
+			// b.Cert can either be a certificate or public key
+			certBytes := []byte(b.Cert)
+			if isb64(certBytes) {
+				certBytes, _ = base64.StdEncoding.DecodeString(b.Cert)
+			}
+			bundleCert, err := loadCertFromPEM(certBytes)
+			if err != nil {
+				// check if cert is actually a public key
+				co.SigVerifier, err = sigs.LoadPublicKeyRaw(certBytes, crypto.SHA256)
+				if err != nil {
+					return fmt.Errorf("loading verifier from bundle: %w", err)
+				}
+			}
+			// if a cert was passed in, make sure it matches the cert in the bundle
+			if cert != nil && !cert.Equal(bundleCert) {
+				return fmt.Errorf("the cert passed in does not match the cert in the provided bundle")
+			}
+			cert = bundleCert
 		}
-		cert, err = loadCertFromPEM(certBytes)
-		if err != nil {
-			// check if cert is actually a public key
-			verifier, err = sigs.LoadPublicKeyRaw(certBytes, crypto.SHA256)
-		} else {
-			verifier, err = signature.LoadECDSAVerifier(cert.PublicKey.(*ecdsa.PublicKey), crypto.SHA256)
-		}
+		opts = append(opts, static.WithBundle(b.Bundle))
+	}
+	if c.RFC3161TimestampPath != "" {
+		var rfc3161Timestamp bundle.RFC3161Timestamp
+		ts, err := blob.LoadFileOrURL(c.RFC3161TimestampPath)
 		if err != nil {
 			return err
 		}
-	case options.EnableExperimental():
-		rClient, err := rekor.NewClient(ko.RekorURL)
+		if err := json.Unmarshal(ts, &rfc3161Timestamp); err != nil {
+			return err
+		}
+		opts = append(opts, static.WithRFC3161Timestamp(&rfc3161Timestamp))
+	}
+	// Set an SCT if provided via the CLI.
+	if c.SCTRef != "" {
+		sct, err := os.ReadFile(filepath.Clean(c.SCTRef))
+		if err != nil {
+			return fmt.Errorf("reading sct from file: %w", err)
+		}
+		co.SCT = sct
+	}
+	// Set a cert chain if provided.
+	var chainPEM []byte
+	switch {
+	case c.CertChain != "":
+		chain, err := loadCertChainFromFileOrURL(c.CertChain)
 		if err != nil {
 			return err
 		}
+		if chain == nil {
+			return errors.New("expected certificate chain in --certificate-chain")
+		}
+		// Set the last one in the co.RootCerts. This is trusted, as its passed in
+		// via the CLI.
+		if co.RootCerts == nil {
+			co.RootCerts = x509.NewCertPool()
+		}
+		co.RootCerts.AddCert(chain[len(chain)-1])
+		// Use the whole as the cert chain in the signature object.
+		// The last one is omitted because it is considered the "root".
+		chainPEM, err = cryptoutils.MarshalCertificatesToPEM(chain)
+		if err != nil {
+			return err
+		}
+	case c.CARoots != "":
+		// CA roots + possible intermediates are already loaded into co.RootCerts with the call to
+		// loadCertsKeylessVerification above.
+	}
 
-		uuids, err := cosign.FindTLogEntriesByPayload(ctx, rClient, blobBytes)
+	// Gather the cert for the signature and add the cert along with the
+	// cert chain into the signature object.
+	var certPEM []byte
+	if cert != nil {
+		certPEM, err = cryptoutils.MarshalCertificateToPEM(cert)
 		if err != nil {
 			return err
 		}
+		opts = append(opts, static.WithCertChain(certPEM, chainPEM))
+	}
 
-		if len(uuids) == 0 {
-			return errors.New("could not find a tlog entry for provided blob")
-		}
-
-		tlogEntry, err := cosign.GetTlogEntry(ctx, rClient, uuids[0])
+	// Ignore Signed Certificate Timestamp if the flag is set or a key is provided
+	if shouldVerifySCT(c.IgnoreSCT, c.KeyRef, c.Sk) {
+		co.CTLogPubKeys, err = cosign.GetCTLogPubs(ctx)
 		if err != nil {
-			return err
-		}
-
-		certs, err := extractCerts(tlogEntry)
-		if err != nil {
-			return err
-		}
-
-		co := &cosign.CheckOpts{
-			RootCerts:      fulcio.GetRoots(),
-			CertEmail:      certEmail,
-			CertOidcIssuer: certOidcIssuer,
-		}
-		cert = certs[0]
-		verifier, err = cosign.ValidateAndUnpackCert(cert, co)
-		if err != nil {
-			return err
+			return fmt.Errorf("getting ctlog public keys: %w", err)
 		}
 	}
 
-	// Use the DSSE verifier if the payload is a DSSE with the In-Toto format.
-	if isIntotoDSSE(blobBytes) {
-		verifier = dsse.WrapVerifier(verifier)
+	signature, err := static.NewSignature(blobBytes, sig, opts...)
+	if err != nil {
+		return err
 	}
-
-	// verify the signature
-	if err := verifier.VerifySignature(bytes.NewReader([]byte(sig)), bytes.NewReader(blobBytes)); err != nil {
+	if _, err = cosign.VerifyBlobSignature(ctx, signature, co); err != nil {
 		return err
 	}
 
-	// verify the rekor entry
-	if err := verifyRekorEntry(ctx, ko, verifier, cert, b64sig, blobBytes); err != nil {
-		return err
-	}
-
-	fmt.Fprintln(os.Stderr, "Verified OK")
+	ui.Infof(ctx, "Verified OK")
 	return nil
 }
 
-// signatures returns the raw signature and the base64 encoded signature
-func signatures(sigRef string, bundlePath string) (string, string, error) {
+// base64signature returns the base64 encoded signature
+func base64signature(sigRef, bundlePath string) (string, error) {
 	var targetSig []byte
 	var err error
 	switch {
 	case sigRef != "":
 		targetSig, err = blob.LoadFileOrURL(sigRef)
 		if err != nil {
-			if !os.IsNotExist(err) {
+			if !errors.Is(err, fs.ErrNotExist) {
 				// ignore if file does not exist, it can be a base64 encoded string as well
-				return "", "", err
+				return "", err
 			}
 			targetSig = []byte(sigRef)
 		}
 	case bundlePath != "":
 		b, err := cosign.FetchLocalSignedPayloadFromPath(bundlePath)
 		if err != nil {
-			return "", "", err
+			return "", err
 		}
 		targetSig = []byte(b.Base64Signature)
 	default:
-		return "", "", fmt.Errorf("missing flag '--signature'")
+		return "", fmt.Errorf("missing flag '--signature'")
 	}
 
-	var sig, b64sig string
 	if isb64(targetSig) {
-		b64sig = string(targetSig)
-		sigBytes, _ := base64.StdEncoding.DecodeString(b64sig)
-		sig = string(sigBytes)
-	} else {
-		sig = string(targetSig)
-		b64sig = base64.StdEncoding.EncodeToString(targetSig)
+		return string(targetSig), nil
 	}
-	return sig, b64sig, nil
+	return base64.StdEncoding.EncodeToString(targetSig), nil
 }
 
 func payloadBytes(blobRef string) ([]byte, error) {
@@ -235,147 +347,4 @@ func payloadBytes(blobRef string) ([]byte, error) {
 		return nil, err
 	}
 	return blobBytes, nil
-}
-
-func verifyRekorEntry(ctx context.Context, ko sign.KeyOpts, pubKey signature.Verifier, cert *x509.Certificate, b64sig string, blobBytes []byte) error {
-	// If we have a bundle with a rekor entry, let's first try to verify offline
-	if ko.BundlePath != "" {
-		if err := verifyRekorBundle(ctx, ko.BundlePath, cert); err == nil {
-			fmt.Fprintf(os.Stderr, "tlog entry verified offline\n")
-			return nil
-		}
-	}
-	if !options.EnableExperimental() {
-		return nil
-	}
-
-	rekorClient, err := rekor.NewClient(ko.RekorURL)
-	if err != nil {
-		return err
-	}
-	var pubBytes []byte
-	if pubKey != nil {
-		pubBytes, err = sigs.PublicKeyPem(pubKey, signatureoptions.WithContext(ctx))
-		if err != nil {
-			return err
-		}
-	}
-	if cert != nil {
-		pubBytes, err = cryptoutils.MarshalCertificateToPEM(cert)
-		if err != nil {
-			return err
-		}
-	}
-	uuid, index, err := cosign.FindTlogEntry(ctx, rekorClient, b64sig, blobBytes, pubBytes)
-	if err != nil {
-		return err
-	}
-	fmt.Fprintf(os.Stderr, "tlog entry verified with uuid: %q index: %d\n", uuid, index)
-	if cert == nil {
-		return nil
-	}
-	// if we have a cert, we should check expiry
-	// The IntegratedTime verified in VerifyTlog
-	e, err := cosign.GetTlogEntry(ctx, rekorClient, uuid)
-	if err != nil {
-		return err
-	}
-	return cosign.CheckExpiry(cert, time.Unix(*e.IntegratedTime, 0))
-}
-
-func verifyRekorBundle(ctx context.Context, bundlePath string, cert *x509.Certificate) error {
-	b, err := cosign.FetchLocalSignedPayloadFromPath(bundlePath)
-	if err != nil {
-		return err
-	}
-	if b.Bundle == nil {
-		return fmt.Errorf("rekor entry is not available")
-	}
-	publicKeys, err := cosign.GetRekorPubs(ctx)
-	if err != nil {
-		return errors.Wrap(err, "retrieving rekor public key")
-	}
-
-	var entryVerError error
-	for _, pubKey := range publicKeys {
-		entryVerError = cosign.VerifySET(b.Bundle.Payload, b.Bundle.SignedEntryTimestamp, pubKey.PubKey)
-		// Exit early with successful verification
-		if entryVerError == nil {
-			if pubKey.Status != tuf.Active {
-				fmt.Fprintf(os.Stderr, "**Info** Successfully verified Rekor entry using an expired verification key\n")
-			}
-			break
-		}
-	}
-	if entryVerError != nil {
-		return entryVerError
-	}
-
-	if cert == nil {
-		return nil
-	}
-	it := time.Unix(b.Bundle.Payload.IntegratedTime, 0)
-	return cosign.CheckExpiry(cert, it)
-}
-
-func extractCerts(e *models.LogEntryAnon) ([]*x509.Certificate, error) {
-	b, err := base64.StdEncoding.DecodeString(e.Body.(string))
-	if err != nil {
-		return nil, err
-	}
-
-	pe, err := models.UnmarshalProposedEntry(bytes.NewReader(b), runtime.JSONConsumer())
-	if err != nil {
-		return nil, err
-	}
-
-	eimpl, err := types.NewEntry(pe)
-	if err != nil {
-		return nil, err
-	}
-
-	var publicKeyB64 []byte
-	switch e := eimpl.(type) {
-	case *rekord.V001Entry:
-		publicKeyB64, err = e.RekordObj.Signature.PublicKey.Content.MarshalText()
-		if err != nil {
-			return nil, err
-		}
-	case *hashedrekord.V001Entry:
-		publicKeyB64, err = e.HashedRekordObj.Signature.PublicKey.Content.MarshalText()
-		if err != nil {
-			return nil, err
-		}
-	default:
-		return nil, errors.New("unexpected tlog entry type")
-	}
-
-	publicKey, err := base64.StdEncoding.DecodeString(string(publicKeyB64))
-	if err != nil {
-		return nil, err
-	}
-
-	certs, err := cryptoutils.UnmarshalCertificatesFromPEM(publicKey)
-	if err != nil {
-		return nil, err
-	}
-
-	if len(certs) == 0 {
-		return nil, errors.New("no certs found in pem tlog")
-	}
-
-	return certs, err
-}
-
-// isIntotoDSSE checks whether a payload is a Dead Simple Signing Envelope with the In-Toto format.
-func isIntotoDSSE(blobBytes []byte) bool {
-	DSSEenvelope := ssldsse.Envelope{}
-	if err := json.Unmarshal(blobBytes, &DSSEenvelope); err != nil {
-		return false
-	}
-	if DSSEenvelope.PayloadType != ctypes.IntotoPayloadType {
-		return false
-	}
-
-	return true
 }

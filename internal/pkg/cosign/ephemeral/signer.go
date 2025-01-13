@@ -19,13 +19,13 @@ import (
 	"context"
 	"crypto"
 	"encoding/base64"
+	"fmt"
 	"io"
 
-	"github.com/pkg/errors"
-	icosign "github.com/sigstore/cosign/internal/pkg/cosign"
-	"github.com/sigstore/cosign/pkg/cosign"
-	"github.com/sigstore/cosign/pkg/oci"
-	"github.com/sigstore/cosign/pkg/oci/static"
+	icosign "github.com/sigstore/cosign/v2/internal/pkg/cosign"
+	"github.com/sigstore/cosign/v2/pkg/cosign"
+	"github.com/sigstore/cosign/v2/pkg/oci"
+	"github.com/sigstore/cosign/v2/pkg/oci/static"
 	"github.com/sigstore/sigstore/pkg/signature"
 )
 
@@ -36,10 +36,10 @@ type ephemeralSigner struct {
 var _ icosign.Signer = ephemeralSigner{}
 
 // Sign implements `Signer`
-func (ks ephemeralSigner) Sign(ctx context.Context, payload io.Reader) (oci.Signature, crypto.PublicKey, error) {
+func (ks ephemeralSigner) Sign(_ context.Context, payload io.Reader) (oci.Signature, crypto.PublicKey, error) {
 	pub, err := ks.signer.PublicKey()
 	if err != nil {
-		return nil, nil, errors.Wrap(err, "retrieving the static public key somehow failed")
+		return nil, nil, fmt.Errorf("retrieving the static public key somehow failed: %w", err)
 	}
 
 	payloadBytes, err := io.ReadAll(payload)
@@ -65,11 +65,11 @@ func (ks ephemeralSigner) Sign(ctx context.Context, payload io.Reader) (oci.Sign
 func NewSigner() (icosign.Signer, error) {
 	priv, err := cosign.GeneratePrivateKey()
 	if err != nil {
-		return nil, errors.Wrap(err, "generating cert")
+		return nil, fmt.Errorf("generating cert: %w", err)
 	}
 	s, err := signature.LoadECDSASignerVerifier(priv, crypto.SHA256)
 	if err != nil {
-		return nil, errors.Wrap(err, "creating a SignerVerifier from ephemeral key")
+		return nil, fmt.Errorf("creating a SignerVerifier from ephemeral key: %w", err)
 	}
 	return ephemeralSigner{
 		signer: s,

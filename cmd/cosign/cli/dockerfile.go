@@ -16,11 +16,13 @@
 package cli
 
 import (
-	"github.com/sigstore/cosign/cmd/cosign/cli/dockerfile"
-	"github.com/sigstore/cosign/cmd/cosign/cli/verify"
+	"fmt"
+
+	"github.com/sigstore/cosign/v2/cmd/cosign/cli/dockerfile"
+	"github.com/sigstore/cosign/v2/cmd/cosign/cli/verify"
 	"github.com/spf13/cobra"
 
-	"github.com/sigstore/cosign/cmd/cosign/cli/options"
+	"github.com/sigstore/cosign/v2/cmd/cosign/cli/options"
 )
 
 func Dockerfile() *cobra.Command {
@@ -40,8 +42,9 @@ func dockerfileVerify() *cobra.Command {
 	o := &options.VerifyDockerfileOptions{}
 
 	cmd := &cobra.Command{
-		Use:   "verify",
-		Short: "Verify a signature on the base image specified in the Dockerfile",
+		Use:              "verify",
+		Short:            "Verify a signature on the base image specified in the Dockerfile",
+		PersistentPreRun: options.BindViper,
 		Long: `Verify signature and annotations on images in a Dockerfile by checking claims
 against the transparency log.
 
@@ -56,9 +59,6 @@ Shell-like variables in the Dockerfile's FROM lines will be substituted with val
 
   # additionally verify specified annotations
   cosign dockerfile verify -a key1=val1 -a key2=val2 <path/to/Dockerfile>
-
-  # (experimental) additionally, verify with the transparency log
-  COSIGN_EXPERIMENTAL=1 cosign dockerfile verify <path/to/Dockerfile>
 
   # verify images with public key
   cosign dockerfile verify --key cosign.pub <path/to/Dockerfile>
@@ -85,21 +85,38 @@ Shell-like variables in the Dockerfile's FROM lines will be substituted with val
 			}
 			v := &dockerfile.VerifyDockerfileCommand{
 				VerifyCommand: verify.VerifyCommand{
-					RegistryOptions: o.Registry,
-					CheckClaims:     o.CheckClaims,
-					KeyRef:          o.Key,
-					CertRef:         o.CertVerify.Cert,
-					CertEmail:       o.CertVerify.CertEmail,
-					CertOidcIssuer:  o.CertVerify.CertOidcIssuer,
-					Sk:              o.SecurityKey.Use,
-					Slot:            o.SecurityKey.Slot,
-					Output:          o.Output,
-					RekorURL:        o.Rekor.URL,
-					Attachment:      o.Attachment,
-					Annotations:     annotations,
+					RegistryOptions:              o.Registry,
+					CertVerifyOptions:            o.CertVerify,
+					CheckClaims:                  o.CheckClaims,
+					KeyRef:                       o.Key,
+					CertRef:                      o.CertVerify.Cert,
+					CertGithubWorkflowTrigger:    o.CertVerify.CertGithubWorkflowTrigger,
+					CertGithubWorkflowSha:        o.CertVerify.CertGithubWorkflowSha,
+					CertGithubWorkflowName:       o.CertVerify.CertGithubWorkflowName,
+					CertGithubWorkflowRepository: o.CertVerify.CertGithubWorkflowRepository,
+					CertGithubWorkflowRef:        o.CertVerify.CertGithubWorkflowRef,
+					CertChain:                    o.CertVerify.CertChain,
+					IgnoreSCT:                    o.CertVerify.IgnoreSCT,
+					SCTRef:                       o.CertVerify.SCT,
+					Sk:                           o.SecurityKey.Use,
+					Slot:                         o.SecurityKey.Slot,
+					Output:                       o.Output,
+					RekorURL:                     o.Rekor.URL,
+					Attachment:                   o.Attachment,
+					Annotations:                  annotations,
+					LocalImage:                   o.LocalImage,
+					Offline:                      o.CommonVerifyOptions.Offline,
+					TSACertChainPath:             o.CommonVerifyOptions.TSACertChainPath,
+					IgnoreTlog:                   o.CommonVerifyOptions.IgnoreTlog,
+					MaxWorkers:                   o.CommonVerifyOptions.MaxWorkers,
 				},
 				BaseOnly: o.BaseImageOnly,
 			}
+
+			if o.CommonVerifyOptions.MaxWorkers == 0 {
+				return fmt.Errorf("please set the --max-worker flag to a value that is greater than 0")
+			}
+
 			return v.Exec(cmd.Context(), args)
 		},
 	}

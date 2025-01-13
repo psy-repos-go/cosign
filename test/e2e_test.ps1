@@ -34,9 +34,9 @@ Write-Output $pass | .\cosign.exe generate-key-pair
 $signing_key = "cosign.key"
 $verification_key = "cosign.pub"
 
-$test_img = "gcr.io/distroless/static"
-Write-Output $pass | .\cosign.exe sign --key $signing_key --output-signature interactive.sig $test_img
-.\cosign.exe verify --key $verification_key --signature interactive.sig $test_img
+$test_img = "ghcr.io/distroless/static"
+Write-Output $pass | .\cosign.exe sign --key $signing_key --output-signature interactive.sig --output-payload interactive.payload --tlog-upload=false $test_img
+.\cosign.exe verify --key $verification_key --signature interactive.sig --payload interactive.payload --insecure-ignore-tlog=true $test_img
 
 Pop-Location
 

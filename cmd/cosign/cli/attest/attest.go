@@ -26,20 +26,21 @@ import (
 
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
-	"github.com/pkg/errors"
 
-	"github.com/sigstore/cosign/cmd/cosign/cli/options"
-	"github.com/sigstore/cosign/cmd/cosign/cli/rekor"
-	"github.com/sigstore/cosign/cmd/cosign/cli/sign"
-	"github.com/sigstore/cosign/pkg/cosign"
-	"github.com/sigstore/cosign/pkg/cosign/attestation"
-	cbundle "github.com/sigstore/cosign/pkg/cosign/bundle"
-	cremote "github.com/sigstore/cosign/pkg/cosign/remote"
-	"github.com/sigstore/cosign/pkg/oci/mutate"
-	ociremote "github.com/sigstore/cosign/pkg/oci/remote"
-	"github.com/sigstore/cosign/pkg/oci/static"
-	sigs "github.com/sigstore/cosign/pkg/signature"
-	"github.com/sigstore/cosign/pkg/types"
+	"github.com/sigstore/cosign/v2/cmd/cosign/cli/options"
+	"github.com/sigstore/cosign/v2/cmd/cosign/cli/rekor"
+	"github.com/sigstore/cosign/v2/cmd/cosign/cli/sign"
+	"github.com/sigstore/cosign/v2/internal/pkg/cosign/tsa"
+	tsaclient "github.com/sigstore/cosign/v2/internal/pkg/cosign/tsa/client"
+	"github.com/sigstore/cosign/v2/internal/ui"
+	"github.com/sigstore/cosign/v2/pkg/cosign"
+	"github.com/sigstore/cosign/v2/pkg/cosign/attestation"
+	cbundle "github.com/sigstore/cosign/v2/pkg/cosign/bundle"
+	cremote "github.com/sigstore/cosign/v2/pkg/cosign/remote"
+	"github.com/sigstore/cosign/v2/pkg/oci/mutate"
+	ociremote "github.com/sigstore/cosign/v2/pkg/oci/remote"
+	"github.com/sigstore/cosign/v2/pkg/oci/static"
+	"github.com/sigstore/cosign/v2/pkg/types"
 	"github.com/sigstore/rekor/pkg/generated/client"
 	"github.com/sigstore/rekor/pkg/generated/models"
 	"github.com/sigstore/sigstore/pkg/signature/dsse"
@@ -49,16 +50,9 @@ import (
 type tlogUploadFn func(*client.Rekor, []byte) (*models.LogEntryAnon, error)
 
 func uploadToTlog(ctx context.Context, sv *sign.SignerVerifier, rekorURL string, upload tlogUploadFn) (*cbundle.RekorBundle, error) {
-	var rekorBytes []byte
-	// Upload the cert or the public key, depending on what we have
-	if sv.Cert != nil {
-		rekorBytes = sv.Cert
-	} else {
-		pemBytes, err := sigs.PublicKeyPem(sv, signatureoptions.WithContext(ctx))
-		if err != nil {
-			return nil, err
-		}
-		rekorBytes = pemBytes
+	rekorBytes, err := sv.Bytes(ctx)
+	if err != nil {
+		return nil, err
 	}
 
 	rekorClient, err := rekor.NewClient(rekorURL)
@@ -73,37 +67,58 @@ func uploadToTlog(ctx context.Context, sv *sign.SignerVerifier, rekorURL string,
 	return cbundle.EntryToBundle(entry), nil
 }
 
-//nolint
-func AttestCmd(ctx context.Context, ko sign.KeyOpts, regOpts options.RegistryOptions, imageRef string, certPath string,
-	noUpload bool, predicatePath string, force bool, predicateType string, replace bool, timeout time.Duration) error {
-	// A key file or token is required unless we're in experimental mode!
-	if options.EnableExperimental() {
-		if options.NOf(ko.KeyRef, ko.Sk) > 1 {
-			return &options.KeyParseError{}
-		}
-	} else {
-		if !options.OneOf(ko.KeyRef, ko.Sk) {
-			return &options.KeyParseError{}
-		}
+// nolint
+type AttestCommand struct {
+	options.KeyOpts
+	options.RegistryOptions
+	CertPath                string
+	CertChainPath           string
+	NoUpload                bool
+	PredicatePath           string
+	PredicateType           string
+	Replace                 bool
+	Timeout                 time.Duration
+	TlogUpload              bool
+	TSAServerURL            string
+	RekorEntryType          string
+	RecordCreationTimestamp bool
+}
+
+// nolint
+func (c *AttestCommand) Exec(ctx context.Context, imageRef string) error {
+	// We can't have both a key and a security key
+	if options.NOf(c.KeyRef, c.Sk) > 1 {
+		return &options.KeyParseError{}
 	}
 
-	predicateURI, err := options.ParsePredicateType(predicateType)
+	if c.PredicatePath == "" {
+		return fmt.Errorf("predicate cannot be empty")
+	}
+
+	if c.RekorEntryType != "dsse" && c.RekorEntryType != "intoto" {
+		return fmt.Errorf("unknown value for rekor-entry-type")
+	}
+
+	predicateURI, err := options.ParsePredicateType(c.PredicateType)
 	if err != nil {
 		return err
 	}
-
-	ref, err := name.ParseReference(imageRef)
+	ref, err := name.ParseReference(imageRef, c.NameOptions()...)
 	if err != nil {
-		return errors.Wrap(err, "parsing reference")
+		return fmt.Errorf("parsing reference: %w", err)
+	}
+	if _, ok := ref.(name.Digest); !ok {
+		msg := fmt.Sprintf(ui.TagReferenceMessage, imageRef)
+		ui.Warnf(ctx, msg)
 	}
 
-	if timeout != 0 {
+	if c.Timeout != 0 {
 		var cancelFn context.CancelFunc
-		ctx, cancelFn = context.WithTimeout(ctx, timeout)
+		ctx, cancelFn = context.WithTimeout(ctx, c.Timeout)
 		defer cancelFn()
 	}
 
-	ociremoteOpts, err := regOpts.ClientOpts(ctx)
+	ociremoteOpts, err := c.RegistryOptions.ClientOpts(ctx)
 	if err != nil {
 		return err
 	}
@@ -117,24 +132,23 @@ func AttestCmd(ctx context.Context, ko sign.KeyOpts, regOpts options.RegistryOpt
 	// each access.
 	ref = digest // nolint
 
-	sv, err := sign.SignerFromKeyOpts(ctx, certPath, ko)
+	sv, err := sign.SignerFromKeyOpts(ctx, c.CertPath, c.CertChainPath, c.KeyOpts)
 	if err != nil {
-		return errors.Wrap(err, "getting signer")
+		return fmt.Errorf("getting signer: %w", err)
 	}
 	defer sv.Close()
 	wrapped := dsse.WrapSigner(sv, types.IntotoPayloadType)
 	dd := cremote.NewDupeDetector(sv)
 
-	fmt.Fprintln(os.Stderr, "Using payload from:", predicatePath)
-	predicate, err := os.Open(predicatePath)
+	predicate, err := predicateReader(c.PredicatePath)
 	if err != nil {
-		return err
+		return fmt.Errorf("getting predicate reader: %w", err)
 	}
 	defer predicate.Close()
 
 	sh, err := attestation.GenerateStatement(attestation.GenerateOpts{
 		Predicate: predicate,
-		Type:      predicateType,
+		Type:      c.PredicateType,
 		Digest:    h.Hex,
 		Repo:      digest.Repository.String(),
 	})
@@ -148,10 +162,10 @@ func AttestCmd(ctx context.Context, ko sign.KeyOpts, regOpts options.RegistryOpt
 	}
 	signedPayload, err := wrapped.SignMessage(bytes.NewReader(payload), signatureoptions.WithContext(ctx))
 	if err != nil {
-		return errors.Wrap(err, "signing")
+		return fmt.Errorf("signing: %w", err)
 	}
 
-	if noUpload {
+	if c.NoUpload {
 		fmt.Println(string(signedPayload))
 		return nil
 	}
@@ -160,11 +174,48 @@ func AttestCmd(ctx context.Context, ko sign.KeyOpts, regOpts options.RegistryOpt
 	if sv.Cert != nil {
 		opts = append(opts, static.WithCertChain(sv.Cert, sv.Chain))
 	}
+	if c.KeyOpts.TSAServerURL != "" {
+		// TODO - change this when we implement protobuf / new bundle support
+		//
+		// Historically, cosign sent the entire JSON DSSE Envelope to the
+		// timestamp authority. However, when sigstore clients are verifying a
+		// bundle they will use the DSSE Sig field, so we choose what signature
+		// to send to the timestamp authority based on our output format.
+		//
+		// See cmd/cosign/cli/attest/attest_blob.go
+		responseBytes, err := tsa.GetTimestampedSignature(signedPayload, tsaclient.NewTSAClient(c.KeyOpts.TSAServerURL))
+		if err != nil {
+			return err
+		}
+		bundle := cbundle.TimestampToRFC3161Timestamp(responseBytes)
+
+		opts = append(opts, static.WithRFC3161Timestamp(bundle))
+	}
+
+	predicateType, err := options.ParsePredicateType(c.PredicateType)
+	if err != nil {
+		return err
+	}
+
+	predicateTypeAnnotation := map[string]string{
+		"predicateType": predicateType,
+	}
+	// Add predicateType as manifest annotation
+	opts = append(opts, static.WithAnnotations(predicateTypeAnnotation))
 
 	// Check whether we should be uploading to the transparency log
-	if sign.ShouldUploadToTlog(ctx, digest, force, ko.RekorURL) {
-		bundle, err := uploadToTlog(ctx, sv, ko.RekorURL, func(r *client.Rekor, b []byte) (*models.LogEntryAnon, error) {
-			return cosign.TLogUploadInTotoAttestation(ctx, r, signedPayload, b)
+	shouldUpload, err := sign.ShouldUploadToTlog(ctx, c.KeyOpts, digest, c.TlogUpload)
+	if err != nil {
+		return fmt.Errorf("should upload to tlog: %w", err)
+	}
+	if shouldUpload {
+		bundle, err := uploadToTlog(ctx, sv, c.RekorURL, func(r *client.Rekor, b []byte) (*models.LogEntryAnon, error) {
+			if c.RekorEntryType == "intoto" {
+				return cosign.TLogUploadInTotoAttestation(ctx, r, signedPayload, b)
+			} else {
+				return cosign.TLogUploadDSSEEnvelope(ctx, r, signedPayload, b)
+			}
+
 		})
 		if err != nil {
 			return err
@@ -177,16 +228,16 @@ func AttestCmd(ctx context.Context, ko sign.KeyOpts, regOpts options.RegistryOpt
 		return err
 	}
 
-	se, err := ociremote.SignedEntity(digest, ociremoteOpts...)
-	if err != nil {
-		return err
-	}
+	// We don't actually need to access the remote entity to attach things to it
+	// so we use a placeholder here.
+	se := ociremote.SignedUnknown(digest, ociremoteOpts...)
 
 	signOpts := []mutate.SignOption{
 		mutate.WithDupeDetector(dd),
+		mutate.WithRecordCreationTimestamp(c.RecordCreationTimestamp),
 	}
 
-	if replace {
+	if c.Replace {
 		ro := cremote.NewReplaceOp(predicateURI)
 		signOpts = append(signOpts, mutate.WithReplaceOp(ro))
 	}

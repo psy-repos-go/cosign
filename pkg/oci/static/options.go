@@ -19,20 +19,22 @@ import (
 	"encoding/json"
 
 	"github.com/google/go-containerregistry/pkg/v1/types"
-	"github.com/sigstore/cosign/pkg/cosign/bundle"
-	ctypes "github.com/sigstore/cosign/pkg/types"
+	"github.com/sigstore/cosign/v2/pkg/cosign/bundle"
+	ctypes "github.com/sigstore/cosign/v2/pkg/types"
 )
 
 // Option is a functional option for customizing static signatures.
 type Option func(*options)
 
 type options struct {
-	LayerMediaType  types.MediaType
-	ConfigMediaType types.MediaType
-	Bundle          *bundle.RekorBundle
-	Cert            []byte
-	Chain           []byte
-	Annotations     map[string]string
+	LayerMediaType          types.MediaType
+	ConfigMediaType         types.MediaType
+	Bundle                  *bundle.RekorBundle
+	RFC3161Timestamp        *bundle.RFC3161Timestamp
+	Cert                    []byte
+	Chain                   []byte
+	Annotations             map[string]string
+	RecordCreationTimestamp bool
 }
 
 func makeOptions(opts ...Option) (*options, error) {
@@ -59,6 +61,13 @@ func makeOptions(opts ...Option) (*options, error) {
 		o.Annotations[BundleAnnotationKey] = string(b)
 	}
 
+	if o.RFC3161Timestamp != nil {
+		b, err := json.Marshal(o.RFC3161Timestamp)
+		if err != nil {
+			return nil, err
+		}
+		o.Annotations[RFC3161TimestampAnnotationKey] = string(b)
+	}
 	return o, nil
 }
 
@@ -90,10 +99,24 @@ func WithBundle(b *bundle.RekorBundle) Option {
 	}
 }
 
+// WithRFC3161Timestamp sets the time-stamping bundle to attach to the signature
+func WithRFC3161Timestamp(b *bundle.RFC3161Timestamp) Option {
+	return func(o *options) {
+		o.RFC3161Timestamp = b
+	}
+}
+
 // WithCertChain sets the certificate chain for this signature.
 func WithCertChain(cert, chain []byte) Option {
 	return func(o *options) {
 		o.Cert = cert
 		o.Chain = chain
+	}
+}
+
+// WithRecordCreationTimestamp sets the feature flag to honor the creation timestamp to time of running
+func WithRecordCreationTimestamp(rct bool) Option {
+	return func(o *options) {
+		o.RecordCreationTimestamp = rct
 	}
 }

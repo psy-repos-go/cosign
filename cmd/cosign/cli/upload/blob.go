@@ -24,12 +24,12 @@ import (
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/v1/types"
 
-	"github.com/sigstore/cosign/cmd/cosign/cli/options"
-	cremote "github.com/sigstore/cosign/pkg/cosign/remote"
+	"github.com/sigstore/cosign/v2/cmd/cosign/cli/options"
+	cremote "github.com/sigstore/cosign/v2/pkg/cosign/remote"
 )
 
-func BlobCmd(ctx context.Context, regOpts options.RegistryOptions, files []cremote.File, contentType, imageRef string) error {
-	ref, err := name.ParseReference(imageRef)
+func BlobCmd(ctx context.Context, regOpts options.RegistryOptions, files []cremote.File, annotations map[string]string, contentType, imageRef string) error {
+	ref, err := name.ParseReference(imageRef, regOpts.NameOptions()...)
 	if err != nil {
 		return err
 	}
@@ -43,7 +43,7 @@ func BlobCmd(ctx context.Context, regOpts options.RegistryOptions, files []cremo
 		}
 	}
 
-	dgstAddr, err := cremote.UploadFiles(ref, files, mt, regOpts.GetRegistryClientOpts(ctx)...)
+	dgstAddr, err := cremote.UploadFiles(ref, files, annotations, mt, regOpts.GetRegistryClientOpts(ctx)...)
 	if err != nil {
 		return err
 	}

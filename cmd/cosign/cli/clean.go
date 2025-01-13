@@ -17,27 +17,32 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"os"
 
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
 	"github.com/spf13/cobra"
 
-	"github.com/sigstore/cosign/cmd/cosign/cli/options"
-	ociremote "github.com/sigstore/cosign/pkg/oci/remote"
+	"github.com/sigstore/cosign/v2/cmd/cosign/cli/options"
+	"github.com/sigstore/cosign/v2/internal/ui"
+	ociremote "github.com/sigstore/cosign/v2/pkg/oci/remote"
 )
 
 func Clean() *cobra.Command {
 	c := &options.CleanOptions{}
 
 	cmd := &cobra.Command{
-		Use:     "clean",
-		Short:   "Remove all signatures from an image.",
-		Example: "  cosign clean <IMAGE>",
-		Args:    cobra.ExactArgs(1),
+		Use:              "clean",
+		Short:            "Remove all signatures from an image.",
+		Example:          "  cosign clean <IMAGE>",
+		Args:             cobra.ExactArgs(1),
+		PersistentPreRun: options.BindViper,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return CleanCmd(cmd.Context(), c.Registry, c.CleanType, args[0])
+			return CleanCmd(cmd.Context(), c.Registry, c.CleanType, args[0], c.Force)
 		},
 	}
 
@@ -45,8 +50,14 @@ func Clean() *cobra.Command {
 	return cmd
 }
 
-func CleanCmd(ctx context.Context, regOpts options.RegistryOptions, cleanType, imageRef string) error {
-	ref, err := name.ParseReference(imageRef)
+func CleanCmd(ctx context.Context, regOpts options.RegistryOptions, cleanType options.CleanType, imageRef string, force bool) error {
+	if !force {
+		ui.Warnf(ctx, prompt(cleanType))
+		if err := ui.ConfirmContinue(ctx); err != nil {
+			return err
+		}
+	}
+	ref, err := name.ParseReference(imageRef, regOpts.NameOptions()...)
 	if err != nil {
 		return err
 	}
@@ -70,24 +81,66 @@ func CleanCmd(ctx context.Context, regOpts options.RegistryOptions, cleanType, i
 
 	var cleanTags []name.Tag
 	switch cleanType {
-	case "signature":
+	case options.CleanTypeSignature:
 		cleanTags = []name.Tag{sigRef}
-	case "sbom":
+	case options.CleanTypeSbom:
 		cleanTags = []name.Tag{sbomRef}
-	case "attestation":
+	case options.CleanTypeAttestation:
 		cleanTags = []name.Tag{attRef}
-	case "all":
+	case options.CleanTypeAll:
 		cleanTags = []name.Tag{sigRef, attRef, sbomRef}
+	default:
+		panic("invalid CleanType value")
 	}
 
 	for _, t := range cleanTags {
-		fmt.Fprintf(os.Stderr, "Removing %s from %s\n", t.String(), imageRef)
-
-		err = remote.Delete(t, remoteOpts...)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "could not delete %s from %s\n: %v\n", t.String(), imageRef, err)
+		if err := remote.Delete(t, remoteOpts...); err != nil {
+			var te *transport.Error
+			switch {
+			case errors.As(err, &te) && te.StatusCode == http.StatusNotFound:
+				// If the tag doesn't exist, some registries may
+				// respond with a 404, which shouldn't be considered an
+				// error.
+			case errors.As(err, &te) && te.StatusCode == http.StatusBadRequest:
+				// Docker registry >=v2.3 requires does not allow deleting the OCI object name directly, must use the digest instead.
+				// See https://github.com/distribution/distribution/blob/main/docs/content/spec/api.md#deleting-an-image
+				if err := deleteByDigest(t, remoteOpts...); err != nil {
+					if errors.As(err, &te) && te.StatusCode == http.StatusNotFound { //nolint: revive
+					} else {
+						fmt.Fprintf(os.Stderr, "could not delete %s by digest from %s:\n%v\n", t, imageRef, err)
+					}
+				} else {
+					fmt.Fprintf(os.Stderr, "Removed %s from %s\n", t, imageRef)
+				}
+			default:
+				fmt.Fprintf(os.Stderr, "could not delete %s from %s:\n%v\n", t, imageRef, err)
+			}
+		} else {
+			fmt.Fprintf(os.Stderr, "Removed %s from %s\n", t, imageRef)
 		}
 	}
 
 	return nil
+}
+
+func deleteByDigest(tag name.Tag, opts ...remote.Option) error {
+	digestTag, err := ociremote.DockerContentDigest(tag, ociremote.WithRemoteOptions(opts...))
+	if err != nil {
+		return err
+	}
+	return remote.Delete(digestTag, opts...)
+}
+
+func prompt(cleanType options.CleanType) string {
+	switch cleanType {
+	case options.CleanTypeSignature:
+		return "this will remove all signatures from the image"
+	case options.CleanTypeSbom:
+		return "this will remove all SBOMs from the image"
+	case options.CleanTypeAttestation:
+		return "this will remove all attestations from the image"
+	case options.CleanTypeAll:
+		return "this will remove all signatures, SBOMs and attestations from the image"
+	}
+	panic("invalid CleanType value")
 }

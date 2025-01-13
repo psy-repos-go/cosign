@@ -18,24 +18,31 @@ package cosign
 import (
 	"context"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"runtime"
+	"sync"
 
 	"github.com/google/go-containerregistry/pkg/name"
-	"github.com/pkg/errors"
-	"github.com/sigstore/cosign/pkg/cosign/bundle"
-	ociremote "github.com/sigstore/cosign/pkg/oci/remote"
-	"knative.dev/pkg/pool"
+	"github.com/in-toto/in-toto-golang/in_toto"
+	"github.com/sigstore/cosign/v2/pkg/cosign/bundle"
+	"github.com/sigstore/cosign/v2/pkg/oci"
+	ociremote "github.com/sigstore/cosign/v2/pkg/oci/remote"
+	"golang.org/x/sync/errgroup"
 )
 
+const maxAllowedSigsOrAtts = 100
+
 type SignedPayload struct {
-	Base64Signature string
-	Payload         []byte
-	Cert            *x509.Certificate
-	Chain           []*x509.Certificate
-	Bundle          *bundle.RekorBundle
+	Base64Signature  string
+	Payload          []byte
+	Cert             *x509.Certificate
+	Chain            []*x509.Certificate
+	Bundle           *bundle.RekorBundle
+	RFC3161Timestamp *bundle.RFC3161Timestamp
 }
 
 type LocalSignedPayload struct {
@@ -56,18 +63,13 @@ type AttestationPayload struct {
 }
 
 const (
-	SignatureTagSuffix   = ".sig"
-	SBOMTagSuffix        = ".sbom"
-	AttestationTagSuffix = ".att"
-)
-
-const (
 	Signature   = "signature"
 	SBOM        = "sbom"
 	Attestation = "attestation"
+	Digest      = "digest"
 )
 
-func FetchSignaturesForReference(ctx context.Context, ref name.Reference, opts ...ociremote.Option) ([]SignedPayload, error) {
+func FetchSignaturesForReference(_ context.Context, ref name.Reference, opts ...ociremote.Option) ([]SignedPayload, error) {
 	simg, err := ociremote.SignedEntity(ref, opts...)
 	if err != nil {
 		return nil, err
@@ -75,21 +77,26 @@ func FetchSignaturesForReference(ctx context.Context, ref name.Reference, opts .
 
 	sigs, err := simg.Signatures()
 	if err != nil {
-		return nil, errors.Wrap(err, "remote image")
+		return nil, fmt.Errorf("remote image: %w", err)
 	}
 	l, err := sigs.Get()
 	if err != nil {
-		return nil, errors.Wrap(err, "fetching signatures")
+		return nil, fmt.Errorf("fetching signatures: %w", err)
 	}
 	if len(l) == 0 {
-		return nil, fmt.Errorf("no signatures associated with %v", ref)
+		return nil, fmt.Errorf("no signatures associated with %s", ref)
+	}
+	if len(l) > maxAllowedSigsOrAtts {
+		return nil, fmt.Errorf("maximum number of signatures on an image is %d, found %d", maxAllowedSigsOrAtts, len(l))
 	}
 
-	g := pool.New(runtime.NumCPU())
 	signatures := make([]SignedPayload, len(l))
+	var g errgroup.Group
+	g.SetLimit(runtime.NumCPU())
 	for i, sig := range l {
 		i, sig := i, sig
-		g.Go(func() (err error) {
+		g.Go(func() error {
+			var err error
 			signatures[i].Payload, err = sig.Payload()
 			if err != nil {
 				return err
@@ -106,6 +113,12 @@ func FetchSignaturesForReference(ctx context.Context, ref name.Reference, opts .
 			if err != nil {
 				return err
 			}
+
+			signatures[i].RFC3161Timestamp, err = sig.RFC3161Timestamp()
+			if err != nil {
+				return err
+			}
+
 			signatures[i].Bundle, err = sig.Bundle()
 			return err
 		})
@@ -117,39 +130,76 @@ func FetchSignaturesForReference(ctx context.Context, ref name.Reference, opts .
 	return signatures, nil
 }
 
-func FetchAttestationsForReference(ctx context.Context, ref name.Reference, opts ...ociremote.Option) ([]AttestationPayload, error) {
-	simg, err := ociremote.SignedEntity(ref, opts...)
+func FetchAttestationsForReference(_ context.Context, ref name.Reference, predicateType string, opts ...ociremote.Option) ([]AttestationPayload, error) {
+	se, err := ociremote.SignedEntity(ref, opts...)
 	if err != nil {
 		return nil, err
 	}
+	return FetchAttestations(se, predicateType)
+}
 
-	atts, err := simg.Attestations()
+func FetchAttestations(se oci.SignedEntity, predicateType string) ([]AttestationPayload, error) {
+	atts, err := se.Attestations()
 	if err != nil {
-		return nil, errors.Wrap(err, "remote image")
+		return nil, fmt.Errorf("remote image: %w", err)
 	}
 	l, err := atts.Get()
 	if err != nil {
-		return nil, errors.Wrap(err, "fetching attestations")
+		return nil, fmt.Errorf("fetching attestations: %w", err)
 	}
 	if len(l) == 0 {
-		return nil, fmt.Errorf("no attestations associated with %v", ref)
+		return nil, errors.New("found no attestations")
+	}
+	if len(l) > maxAllowedSigsOrAtts {
+		errMsg := fmt.Sprintf("maximum number of attestations on an image is %d, found %d", maxAllowedSigsOrAtts, len(l))
+		return nil, errors.New(errMsg)
 	}
 
-	g := pool.New(runtime.NumCPU())
-	attestations := make([]AttestationPayload, len(l))
-	for i, att := range l {
-		i, att := i, att
-		g.Go(func() (err error) {
-			attestPayload, _ := att.Payload()
-			err = json.Unmarshal(attestPayload, &attestations[i])
+	attestations := make([]AttestationPayload, 0, len(l))
+	var attMu sync.Mutex
+
+	var g errgroup.Group
+	g.SetLimit(runtime.NumCPU())
+
+	for _, att := range l {
+		att := att
+		g.Go(func() error {
+			rawPayload, err := att.Payload()
 			if err != nil {
-				return err
+				return fmt.Errorf("fetching payload: %w", err)
 			}
-			return err
+			var payload AttestationPayload
+			if err := json.Unmarshal(rawPayload, &payload); err != nil {
+				return fmt.Errorf("unmarshaling payload: %w", err)
+			}
+
+			if predicateType != "" {
+				var decodedPayload []byte
+				decodedPayload, err = base64.StdEncoding.DecodeString(payload.PayLoad)
+				if err != nil {
+					return fmt.Errorf("decoding payload: %w", err)
+				}
+				var statement in_toto.Statement
+				if err := json.Unmarshal(decodedPayload, &statement); err != nil {
+					return fmt.Errorf("unmarshaling statement: %w", err)
+				}
+				if statement.PredicateType != predicateType {
+					return nil
+				}
+			}
+
+			attMu.Lock()
+			defer attMu.Unlock()
+			attestations = append(attestations, payload)
+			return nil
 		})
 	}
 	if err := g.Wait(); err != nil {
 		return nil, err
+	}
+
+	if len(attestations) == 0 && predicateType != "" {
+		return nil, fmt.Errorf("no attestations with predicate type '%s' found", predicateType)
 	}
 
 	return attestations, nil
@@ -157,9 +207,9 @@ func FetchAttestationsForReference(ctx context.Context, ref name.Reference, opts
 
 // FetchLocalSignedPayloadFromPath fetches a local signed payload from a path to a file
 func FetchLocalSignedPayloadFromPath(path string) (*LocalSignedPayload, error) {
-	contents, err := ioutil.ReadFile(path)
+	contents, err := os.ReadFile(path)
 	if err != nil {
-		return nil, errors.Wrapf(err, "reading %s", path)
+		return nil, fmt.Errorf("reading %s: %w", path, err)
 	}
 	var b *LocalSignedPayload
 	if err := json.Unmarshal(contents, &b); err != nil {

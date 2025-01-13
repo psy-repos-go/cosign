@@ -19,10 +19,9 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/pkg/errors"
-	"github.com/sigstore/cosign/cmd/cosign/cli/generate"
-	"github.com/sigstore/cosign/cmd/cosign/cli/options"
-	"github.com/sigstore/cosign/cmd/cosign/cli/sign"
+	"github.com/sigstore/cosign/v2/cmd/cosign/cli/generate"
+	"github.com/sigstore/cosign/v2/cmd/cosign/cli/options"
+	"github.com/sigstore/cosign/v2/cmd/cosign/cli/sign"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 )
@@ -37,10 +36,13 @@ func SignBlob() *cobra.Command {
 		Example: `  cosign sign-blob --key <key path>|<kms uri> <blob>
 
   # sign a blob with Google sign-in (experimental)
-  COSIGN_EXPERIMENTAL=1 cosign --timeout 90s sign-blob <FILE>
+  cosign sign-blob <FILE> --output-signature <FILE> --output-certificate <FILE>
 
   # sign a blob with a local key pair file
   cosign sign-blob --key cosign.key <FILE>
+
+  # sign a blob with a key stored in an environment variable
+  cosign sign-blob --key env://[ENV_VAR] <FILE>
 
   # sign a blob with a key pair stored in Azure Key Vault
   cosign sign-blob --key azurekms://[VAULT_NAME][VAULT_URI]/[KEY] <FILE>
@@ -53,39 +55,55 @@ func SignBlob() *cobra.Command {
 
   # sign a blob with a key pair stored in Hashicorp Vault
   cosign sign-blob --key hashivault://[KEY] <FILE>`,
-		Args: cobra.MinimumNArgs(1),
-		PreRunE: func(cmd *cobra.Command, args []string) error {
-			// A key file is required unless we're in experimental mode!
-			if !options.EnableExperimental() {
-				if !options.OneOf(o.Key, o.SecurityKey.Use) {
-					return &options.KeyParseError{}
-				}
+		Args:             cobra.MinimumNArgs(1),
+		PersistentPreRun: options.BindViper,
+		PreRunE: func(_ *cobra.Command, _ []string) error {
+			if options.NOf(o.Key, o.SecurityKey.Use) > 1 {
+				return &options.KeyParseError{}
 			}
 			return nil
 		},
-		RunE: func(cmd *cobra.Command, args []string) error {
-			ko := sign.KeyOpts{
-				KeyRef:                   o.Key,
-				PassFunc:                 generate.GetPass,
-				Sk:                       o.SecurityKey.Use,
-				Slot:                     o.SecurityKey.Slot,
-				FulcioURL:                o.Fulcio.URL,
-				IDToken:                  o.Fulcio.IdentityToken,
-				InsecureSkipFulcioVerify: o.Fulcio.InsecureSkipFulcioVerify,
-				RekorURL:                 o.Rekor.URL,
-				OIDCIssuer:               o.OIDC.Issuer,
-				OIDCClientID:             o.OIDC.ClientID,
-				OIDCClientSecret:         o.OIDC.ClientSecret,
-				BundlePath:               o.BundlePath,
+		RunE: func(_ *cobra.Command, args []string) error {
+			oidcClientSecret, err := o.OIDC.ClientSecret()
+			if err != nil {
+				return err
 			}
+			ko := options.KeyOpts{
+				KeyRef:                         o.Key,
+				PassFunc:                       generate.GetPass,
+				Sk:                             o.SecurityKey.Use,
+				Slot:                           o.SecurityKey.Slot,
+				FulcioURL:                      o.Fulcio.URL,
+				IDToken:                        o.Fulcio.IdentityToken,
+				FulcioAuthFlow:                 o.Fulcio.AuthFlow,
+				InsecureSkipFulcioVerify:       o.Fulcio.InsecureSkipFulcioVerify,
+				RekorURL:                       o.Rekor.URL,
+				OIDCIssuer:                     o.OIDC.Issuer,
+				OIDCClientID:                   o.OIDC.ClientID,
+				OIDCClientSecret:               oidcClientSecret,
+				OIDCRedirectURL:                o.OIDC.RedirectURL,
+				OIDCDisableProviders:           o.OIDC.DisableAmbientProviders,
+				BundlePath:                     o.BundlePath,
+				NewBundleFormat:                o.NewBundleFormat,
+				SkipConfirmation:               o.SkipConfirmation,
+				TSAClientCACert:                o.TSAClientCACert,
+				TSAClientCert:                  o.TSAClientCert,
+				TSAClientKey:                   o.TSAClientKey,
+				TSAServerName:                  o.TSAServerName,
+				TSAServerURL:                   o.TSAServerURL,
+				RFC3161TimestampPath:           o.RFC3161TimestampPath,
+				IssueCertificateForExistingKey: o.IssueCertificate,
+			}
+
 			for _, blob := range args {
 				// TODO: remove when the output flag has been deprecated
 				if o.Output != "" {
 					fmt.Fprintln(os.Stderr, "WARNING: the '--output' flag is deprecated and will be removed in the future. Use '--output-signature'")
 					o.OutputSignature = o.Output
 				}
-				if _, err := sign.SignBlobCmd(ro, ko, o.Registry, blob, o.Base64Output, o.OutputSignature, o.OutputCertificate); err != nil {
-					return errors.Wrapf(err, "signing %s", blob)
+
+				if _, err := sign.SignBlobCmd(ro, ko, blob, o.Base64Output, o.OutputSignature, o.OutputCertificate, o.TlogUpload); err != nil {
+					return fmt.Errorf("signing %s: %w", blob, err)
 				}
 			}
 			return nil

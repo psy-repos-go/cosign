@@ -21,9 +21,12 @@ import (
 
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/google/go-containerregistry/pkg/v1/partial"
 	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
-	"github.com/sigstore/cosign/pkg/oci"
+	"github.com/sigstore/cosign/v2/pkg/oci"
 )
+
+var ErrImageNotFound = errors.New("image not found in registry")
 
 // SignedImage provides access to a remote image reference, and its signatures.
 func SignedImage(ref name.Reference, options ...Option) (oci.SignedImage, error) {
@@ -31,7 +34,7 @@ func SignedImage(ref name.Reference, options ...Option) (oci.SignedImage, error)
 	ri, err := remoteImage(ref, o.ROpt...)
 	var te *transport.Error
 	if errors.As(err, &te) && te.StatusCode == http.StatusNotFound {
-		return nil, errors.New("image not found in registry")
+		return nil, ErrImageNotFound
 	} else if err != nil {
 		return nil, err
 	}
@@ -44,6 +47,12 @@ func SignedImage(ref name.Reference, options ...Option) (oci.SignedImage, error)
 type image struct {
 	v1.Image
 	opt *options
+}
+
+// The wrapped Image implements ConfigLayer, but the wrapping hides that from typechecks in pkg/v1/remote.
+// Make image explicitly implement ConfigLayer so that this returns a mountable config layer for pkg/v1/remote.
+func (i *image) ConfigLayer() (v1.Layer, error) {
+	return partial.ConfigLayer(i.Image)
 }
 
 var _ oci.SignedImage = (*image)(nil)
